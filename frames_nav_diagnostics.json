@@ -1,0 +1,66 @@
+[
+  {
+    "frame_url": "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/hole_making_holem_intros",
+    "diagnostic": {
+      "title": "基于特征加工",
+      "out": [],
+      "bodySnippet": "Siemens\nDigital Industries Software\nZH\n登录\n支持中心\nNX\n文档\n12.0.2 Maintenance Release\n基于特征加工\nSearch\n本文档\n所有文档\nSearch\nFeature-based machining\nMachining Feature Navigator\nFinding machining features\nFind machining features\nFind Features options\nDelaying feature updates\nFeature update acceptance criteria\nMap Features\nFeature Identification\nParametric Recognition\nManual Recognition\nFind machining features with Manual Recognition\nTagging features\nLegacy hole features and UDF\nLegacy Face and Pocket Recognitio"
+    }
+  },
+  {
+    "frame_url": "https://docs.sw.siemens.com/documentation/external/PL20190529153536917/zh-CN/nx/12.0.2/nx_help_sc/zh-CN/mfgholemaking/id1291521/holem_intros.html",
+    "diagnostic": {
+      "title": "Feature-based hole machining using hole_makinghole_making",
+      "out": [],
+      "bodySnippet": "Feature-based hole machining using hole_making\n\nYou can use the hole_making operation type template to create the following manual feature-based operations to machine holes:\n\nSpot Drilling \n\nDrilling \n\nCountersinking \n\nTapping \n\nHole Milling \n\nBoss Milling \n\nThread Milling \n\nBoss Thread Milling \n\nThe part to machine can contain features, geometric entities with attributes, features with attributes, or any combination of the three.\n\nHole Making and Hole Mill\n\nThe legacy Hole Making  and Hole Mill"
+    }
+  },
+  {
+    "frame_url": "about:blank",
+    "diagnostic": {
+      "title": "",
+      "out": [],
+      "bodySnippet": ""
+    }
+  },
+  {
+    "frame_url": "https://www.googletagmanager.com/static/service_worker/61k0/sw_iframe.html?origin=https%3A%2F%2Fdocs.sw.siemens.com",
+    "diagnostic": {
+      "title": "",
+      "out": [],
+      "bodySnippet": ""
+    }
+  },
+  {
+    "frame_url": "about:blank",
+    "diagnostic": {
+      "title": "",
+      "out": [],
+      "bodySnippet": ""
+    }
+  },
+  {
+    "frame_url": "https://sgtm.sw.siemens.com/_/service_worker/61k0/sw_iframe.html?origin=https%3A%2F%2Fdocs.sw.siemens.com&1p=1",
+    "diagnostic": {
+      "title": "",
+      "out": [],
+      "bodySnippet": "\n  \n'use strict';var l={};class m{constructor(a){this.j=a;this.g={};this.h={};this.i=0;this.id=String(Math.floor(Number.MAX_SAFE_INTEGER*Math.random()))}}function n(a){return a.performance&&a.performance.now()||Date.now()}\nvar p=function(a,c){class d{constructor(b,f,g){this.failureType=b;this.data=f;this.g=g;this.h=new m(n(g))}o(b,f){const g=b.clientId;if(b.type===0){b.isDead=!0;var e=this.h,k=n(this.g);e.g[g]==null&&(e.g[g]=0,e.h[g]=k,e.i++);e.g[g]++;b.stats={targetId:e.id,clientCount:e.i,total"
+    }
+  },
+  {
+    "frame_url": "https://s.company-target.com/s/sync?exc=lr",
+    "diagnostic": {
+      "title": "Pixels",
+      "out": [],
+      "bodySnippet": ""
+    }
+  },
+  {
+    "frame_url": "https://js.refiner.io/v001/render/index.html",
+    "diagnostic": {
+      "title": "Survey",
+      "out": [],
+      "bodySnippet": ""
+    }
+  }
+]
