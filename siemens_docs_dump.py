@@ -12,6 +12,7 @@ URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgho
 OUT_HTML = "siemens_docs_all.html"
 PAGES_DIR = "siemens_pages"
 STATE_FILE = "siemens_docs_state.json"
+NAV_FILE = "siemens_nav_structure.json"
 
 def _env_bool(name, default=False):
     v = os.environ.get(name)
@@ -139,75 +140,134 @@ def expand_all_tree_nodes(frame, selector_hint=None):
             break
     print(f"ℹ️ 总共展开了 {expanded_count} 个节点。")
 
-def collect_nav_links(frame, selector_hint=None):
-    """从目录树中收集所有导航链接。"""
-    print("🔗 正在收集导航链接...")
+def collect_nav_tree(frame, selector_hint=None):
+    """从目录树中收集导航树结构。"""
+    print("🔗 正在收集导航树结构...")
     try:
-        links = frame.evaluate("""
+        tree_data = frame.evaluate("""
             (selector_hint) => {
-                const links = [];
-                let root = document;
-                
+                function getChildren(element) {
+                    const nodes = [];
+                    // 查找直接的 li 子元素
+                    let lis = [];
+                    
+                    // 尝试找到 ul/ol 容器
+                    let container = element.querySelector(':scope > ul, :scope > ol, :scope > div > ul');
+                    if (!container && (element.tagName === 'UL' || element.tagName === 'OL')) {
+                        container = element;
+                    }
+                    
+                    if (container) {
+                        lis = Array.from(container.children).filter(c => c.tagName === 'LI');
+                    } else {
+                        // 尝试 role="treeitem"
+                        lis = Array.from(element.querySelectorAll(':scope > [role="treeitem"]'));
+                    }
+
+                    for (const li of lis) {
+                        // 提取链接和文本
+                        const a = li.querySelector(':scope > a') || li.querySelector('a'); // 优先找直接子元素
+                        let text = "";
+                        let href = "";
+                        
+                        if (a) {
+                            text = a.innerText.trim();
+                            href = a.href;
+                        } else {
+                            // 尝试获取直接文本
+                            const clone = li.cloneNode(true);
+                            clone.querySelectorAll('ul, ol').forEach(e => e.remove());
+                            text = clone.innerText.trim();
+                        }
+                        
+                        // 递归查找子节点
+                        const children = getChildren(li);
+                        
+                        if (text || children.length > 0) {
+                            nodes.push({
+                                text: text,
+                                href: href,
+                                children: children
+                            });
+                        }
+                    }
+                    return nodes;
+                }
+
+                // 定位根容器
+                let root = null;
                 if (selector_hint) {
                     const el = document.querySelector(selector_hint);
                     if (el) {
-                        root = el.closest('nav') || el.closest('.toc') || el.closest('[role="tree"]') || el.parentElement || document;
+                        root = el.closest('.doc-sidebar') || el.closest('.toc') || el.closest('[role="tree"]');
                     }
-                } else {
-                    const sidebar = document.querySelector('.doc-sidebar, .toc, .nav-tree, #toc, [role="tree"]');
-                    if (sidebar) root = sidebar;
                 }
-
-                let items = root.querySelectorAll('[role="treeitem"] a');
-                
-                if (items.length === 0) {
-                    items = root.querySelectorAll('.toc-tree a, .nav-tree a, ul.toc a');
+                if (!root) {
+                    root = document.querySelector('.doc-sidebar, .toc, .nav-tree, #toc, [role="tree"]');
                 }
                 
-                if (items.length === 0 && root !== document) {
-                    items = root.querySelectorAll('li a');
+                // 如果还是没找到，尝试找页面上最大的 ul
+                if (!root) {
+                    const uls = document.querySelectorAll('ul');
+                    let maxLi = 0;
+                    uls.forEach(ul => {
+                        const count = ul.querySelectorAll('li').length;
+                        if (count > maxLi) {
+                            maxLi = count;
+                            root = ul;
+                        }
+                    });
                 }
 
-                items.forEach(a => {
-                    if (a.href && !a.href.startsWith('javascript:')) {
-                        links.push({
-                            text: a.innerText.trim(),
-                            href: a.href
-                        });
-                    }
-                });
-                return links;
+                if (!root) return [];
+                
+                return getChildren(root);
             }
         """, selector_hint)
         
-        unique_links = []
-        seen_hrefs = set()
-        
-        for link in links:
-            href = link['href']
-            text = link['text']
-            
-            if not href.startswith('http'): continue
-            
-            if "support.sw.siemens.com" in href:
-                if "/doc/" not in href and "/documentation/" not in href:
-                    continue
-            
-            if "login.siemens.com" in href: continue
-            if "siemens.com/global" in href: continue
-            
-            if text in ["Support Center", "支持中心", "Documentation", "文档", "Home", "首页"]:
-                continue
-
-            if href not in seen_hrefs:
-                unique_links.append(link)
-                seen_hrefs.add(href)
-        
-        print(f"✅ 收集到 {len(unique_links)} 个目录节点链接。")
-        return unique_links
+        print(f"✅ 收集到树状结构，根节点数: {len(tree_data)}")
+        return tree_data
     except Exception as e:
-        print(f"❌ 收集导航链接失败: {e}")
+        print(f"❌ 收集导航树失败: {e}")
         return []
+
+def process_tree_and_flatten(nodes, parent_id=""):
+    """处理树状结构，分配ID，并返回扁平化的下载列表。"""
+    flat_list = []
+    processed_nodes = []
+    
+    for i, node in enumerate(nodes):
+        current_id = f"{parent_id}_{i}" if parent_id else f"node_{i}"
+        node['id'] = current_id
+        
+        # 处理 href
+        href = node.get('href')
+        valid_link = False
+        if href and href.startswith('http') and "javascript:" not in href:
+             if "login.siemens.com" not in href and "siemens.com/global" not in href:
+                 valid_link = True
+        
+        if valid_link:
+            flat_list.append({
+                'id': current_id,
+                'text': node['text'],
+                'href': href
+            })
+        else:
+            node['href'] = "" # 清空无效链接
+            
+        # 递归
+        if node.get('children'):
+            children_flat, children_nodes = process_tree_and_flatten(node['children'], current_id)
+            flat_list.extend(children_flat)
+            node['children'] = children_nodes
+            node['hasChildren'] = True
+        else:
+            node['hasChildren'] = False
+            
+        processed_nodes.append(node)
+        
+    return flat_list, processed_nodes
 
 def _sanitize_filename(s):
     s = re.sub(r'[\\/*?:"<>|]', "", s)
@@ -235,62 +295,96 @@ def process_page_content(page, frame):
         }
     """)
     
-    # 2. 获取所有图片 URL 和 CSS URL
+    # 2. 获取所有图片 URL、CSS URL 和内联样式
     resource_urls = frame.evaluate("""
         () => {
-            const imgs = Array.from(document.querySelectorAll('img')).map(i => ({type: 'img', url: i.src}));
-            const css = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map(l => ({type: 'css', url: l.href}));
-            return [...imgs, ...css];
+            const resources = [];
+            
+            // 收集图片
+            document.querySelectorAll('img').forEach(img => {
+                if (img.src && !img.src.startsWith('data:')) {
+                    resources.push({type: 'img', url: img.src});
+                }
+            });
+            
+            // 收集外部CSS
+            document.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+                if (link.href) {
+                    resources.push({type: 'external-css', url: link.href});
+                }
+            });
+            
+            // 收集内联样式
+            document.querySelectorAll('style').forEach(style => {
+                if (style.innerHTML.trim()) {
+                    resources.push({type: 'inline-style', content: style.innerHTML.trim()});
+                }
+            });
+            
+            return resources;
         }
     """)
     
     # 3. 在 Python 端下载并编码 (利用 Playwright 的 request context 共享 cookie)
-    # 这样可以避免浏览器内的 CORS 问题
     resource_map = {}
+    inline_styles = []
+    
+    base_url = frame.url if hasattr(frame, 'url') else page.url
+    
     for res in resource_urls:
-        url = res['url']
-        if not url or url.startswith('data:') or url in resource_map:
-            continue
+        if res['type'] == 'inline-style':
+            inline_styles.append(res['content'])
+        else:
+            url = res['url']
+            if not url or url.startswith('data:') or url in resource_map:
+                continue
             
-        try:
-            # 使用 page.request (APIRequestContext) 下载
-            response = page.request.get(url, timeout=10000)
-            if response.status == 200:
-                body = response.body()
+            if url.startswith('../') or url.startswith('./'):
+                from urllib.parse import urljoin
+                full_url = urljoin(base_url, url)
+            else:
+                full_url = url
+                
+            try:
+                response = page.request.get(full_url, timeout=10000)
+                if response.status == 200:
+                    body = response.body()
+                    if res['type'] == 'img':
+                        b64 = base64.b64encode(body).decode('utf-8')
+                        mime = "image/jpeg"
+                        if full_url.lower().endswith('.png'): mime = "image/png"
+                        elif full_url.lower().endswith('.gif'): mime = "image/gif"
+                        elif full_url.lower().endswith('.svg'): mime = "image/svg+xml"
+                        resource_map[url] = f"data:{mime};base64,{b64}"
+                    elif res['type'] == 'external-css':
+                        resource_map[url] = body.decode('utf-8', errors='ignore')
+            except Exception as e:
                 if res['type'] == 'img':
-                    # 转 Base64
-                    b64 = base64.b64encode(body).decode('utf-8')
-                    # 简单的 MIME 类型猜测
-                    mime = "image/jpeg"
-                    if url.lower().endswith('.png'): mime = "image/png"
-                    elif url.lower().endswith('.gif'): mime = "image/gif"
-                    elif url.lower().endswith('.svg'): mime = "image/svg+xml"
-                    
-                    resource_map[url] = f"data:{mime};base64,{b64}"
-                elif res['type'] == 'css':
-                    # CSS 文本
-                    resource_map[url] = body.decode('utf-8', errors='ignore')
-        except Exception as e:
-            # print(f"    ⚠️ 下载资源失败: {url} - {e}")
-            pass
-
-    # 4. 将编码后的资源注入回页面
-    # 我们传递一个大对象给 evaluate，让它去替换
-    # 同时，获取图片的计算后尺寸，并作为内联样式添加
-    frame.evaluate("""
-        (resourceMap) => {
-            // 替换图片
+                    resource_map[url] = url 
+    
+    # 4. 将样式和资源注入回页面
+    try:
+        frame.evaluate("""(data) => {
+            const resourceMap = data.resourceMap;
+            const inlineStyles = data.inlineStyles;
+            
+            document.querySelectorAll('style, link[rel="stylesheet"]').forEach(el => el.remove());
+            
+            inlineStyles.forEach((content) => {
+                const style = document.createElement('style');
+                style.textContent = content;
+                document.head.appendChild(style);
+            });
+            
             document.querySelectorAll('img').forEach(img => {
                 if (resourceMap[img.src]) {
                     img.src = resourceMap[img.src];
-                    // 获取计算后的尺寸并作为内联样式添加
                     const computedStyle = window.getComputedStyle(img);
                     img.style.width = computedStyle.width;
                     img.style.height = computedStyle.height;
                 }
             });
             
-            // 替换 CSS
             document.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
                 if (resourceMap[link.href]) {
                     const style = document.createElement('style');
@@ -298,30 +392,36 @@ def process_page_content(page, frame):
                     link.parentNode.replaceChild(style, link);
                 }
             });
-        }
-    """, resource_map)
-    
+        }""", {"resourceMap": resource_map, "inlineStyles": inline_styles})
+    except Exception as e:
+        print(f"    ⚠️ 注入样式时出错: {e}")
+
     # 5. 提取主要内容区域
-    # 尝试定位 .main.content-container，如果找不到则取 body
     try:
-        # 优先获取特定容器
         content_html = frame.locator('.main.content-container').first.evaluate("el => el.outerHTML")
     except:
         try:
-            # 备选容器
             content_html = frame.locator('article').first.evaluate("el => el.outerHTML")
         except:
-            # 回退到 body innerHTML
             content_html = frame.evaluate("document.body.innerHTML")
-            
+    
+    # 6. 保存样式元数据
+    style_metadata = {
+        'inline_styles': inline_styles,
+        'external_css_urls': [res['url'] for res in resource_urls if res['type'] == 'external-css'],
+        'resource_map_keys': list(resource_map.keys()),
+        'base64_images': {k: v for k, v in resource_map.items() if k.startswith('data:image') or (v.startswith('data:image') if isinstance(v, str) else False)}
+    }
+    
+    content_html = f'<!-- STYLE_METADATA: {json.dumps(style_metadata)} -->\n{content_html}'
+    
     return content_html
 
 
-def harvest_and_aggregate(context, nav_links, base_url, resume=True):
-    """遍历导航链接，抓取每个页面的内容，并最后聚合成一个文件。"""
+def harvest_and_aggregate(context, download_list, resume=True):
+    """遍历下载列表，抓取内容。"""
     pages_dir = os.path.join(os.path.dirname(__file__), PAGES_DIR)
     
-    # 如果是重新下载，清空目录
     if not resume:
         if os.path.exists(pages_dir):
             shutil.rmtree(pages_dir)
@@ -329,24 +429,24 @@ def harvest_and_aggregate(context, nav_links, base_url, resume=True):
         
     os.makedirs(pages_dir, exist_ok=True)
     
-    print(f"📥 开始抓取 {len(nav_links)} 个页面...")
+    print(f"📥 开始抓取 {len(download_list)} 个页面...")
     
-    for i, link in enumerate(nav_links):
-        href = link.get('href')
-        text = link.get('text')
-        if not href:
-            continue
-
-        filename = f"{i:03d}_{_sanitize_filename(text)}.html"
+    for i, item in enumerate(download_list):
+        href = item['href']
+        text = item['text']
+        node_id = item['id']
+        
+        # 使用 ID 作为文件名，确保唯一且可映射
+        filename = f"{node_id}.html"
         filepath = os.path.join(pages_dir, filename)
 
         if resume and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            print(f"  ({i+1}/{len(nav_links)}) 跳过已存在: {text}")
+            print(f"  ({i+1}/{len(download_list)}) 跳过已存在: {text}")
             continue
 
         page = context.new_page()
         try:
-            print(f"  ({i+1}/{len(nav_links)}) 正在抓取: {text} ({href})")
+            print(f"  ({i+1}/{len(download_list)}) 正在抓取: {text} ({href})")
             page.goto(href, wait_until="domcontentloaded", timeout=60000)
             
             accept_cookies(page)
@@ -361,14 +461,12 @@ def harvest_and_aggregate(context, nav_links, base_url, resume=True):
                 except:
                     pass
                 
-                # --- 处理并提取内容 ---
                 html_content = process_page_content(page, content_frame)
                 
             except Exception as e:
                 print(f"    ⚠️ 无法获取 content frame，尝试直接抓取主页面: {e}")
                 html_content = process_page_content(page, page)
 
-            # 包装一下，确保是合法的 HTML 片段
             if not html_content.strip().startswith('<div') and not html_content.strip().startswith('<article'):
                  html_content = f'<div class="fallback-content">{html_content}</div>'
 
@@ -382,90 +480,255 @@ def harvest_and_aggregate(context, nav_links, base_url, resume=True):
             page.close()
 
     print("✅ 所有页面抓取完成。")
-    
     print("🏗️ 开始聚合成单个 HTML 文件...")
     aggregate_saved_pages(pages_dir, OUT_HTML)
 
+def render_sidebar_html(nodes):
+    """递归生成侧边栏 HTML"""
+    if not nodes:
+        return ""
+    
+    html = '<ul class="nested">'
+    for node in nodes:
+        node_id = node.get('id', '')
+        text = node.get('text', 'Untitled')
+        has_children = node.get('hasChildren', False)
+        href = node.get('href', '')
+        
+        html += '<li>'
+        
+        # 展开/折叠图标
+        if has_children:
+            html += '<span class="caret" onclick="toggleNode(this)"></span>'
+        else:
+            html += '<span class="no-caret"></span>'
+            
+        # 链接
+        if href:
+            # 指向对应的内容锚点
+            html += f'<a href="#content_{node_id}" onclick="handleManualClick(this)">{text}</a>'
+        else:
+            html += f'<span class="nav-text">{text}</span>'
+            
+        # 递归子节点
+        if has_children:
+            # 默认展开第一层? 或者全部折叠。这里默认折叠，通过 JS 控制
+            html += render_sidebar_html(node.get('children', []))
+            
+        html += '</li>'
+        
+    html += '</ul>'
+    return html
 
 def aggregate_saved_pages(pages_dir, out_file):
-    """将保存的 HTML 页面聚合成一个文件。"""
-    files = sorted([f for f in os.listdir(pages_dir) if f.lower().endswith('.html')])
-    if not files:
-        print("⚠️ 聚合失败: 未找到任何已保存的 HTML 文件。")
-        return
-
-    bodies = []
+    """将保存的 HTML 页面聚合成一个文件，带侧边栏。"""
     
-    # 收集样式：这次我们从所有文件中提取内联的 <style>，因为每个文件可能内联了不同的 CSS
-    # 但为了避免重复，我们做一个简单的去重
-    all_styles = set()
+    # 读取导航结构
+    nav_structure = []
+    if os.path.exists(NAV_FILE):
+        with open(NAV_FILE, 'r', encoding='utf-8') as f:
+            nav_structure = json.load(f)
+    else:
+        print("⚠️ 未找到导航结构文件，将无法生成侧边栏。")
 
-    for filename in files:
-        filepath = os.path.join(pages_dir, filename)
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
+    # 收集内容和样式
+    bodies = []
+    all_styles = set()
+    
+    # 遍历下载目录中的文件
+    # 注意：这里我们不直接遍历目录，而是应该根据 nav_structure 的顺序来或者直接读取所有文件
+    # 为了简单，我们读取所有文件，并存入字典，然后在生成 HTML 时按需取用？
+    # 不，更好的方式是：内容区域只包含已下载的页面。
+    
+    files_content = {}
+    if os.path.exists(pages_dir):
+        for f in os.listdir(pages_dir):
+            if f.endswith('.html'):
+                path = os.path.join(pages_dir, f)
+                try:
+                    with open(path, 'r', encoding='utf-8') as file:
+                        files_content[f] = file.read()
+                except:
+                    pass
+
+    # 提取样式并准备内容块
+    # 我们需要遍历 nav_structure 来确定顺序吗？其实内容区域的顺序不重要，重要的是 ID 对应
+    # 但为了线性阅读，最好还是按顺序
+    
+    def process_nodes_for_content(nodes):
+        content_blocks = []
+        for node in nodes:
+            node_id = node.get('id')
+            filename = f"{node_id}.html"
             
-            # 提取 style
-            styles = re.findall(r'<style[^>]*>([\s\S]*?)<\/style>', content, re.IGNORECASE)
-            for s in styles:
-                all_styles.add(s.strip())
+            if filename in files_content:
+                content = files_content[filename]
+                
+                # 提取样式
+                style_match = re.search(r'<!-- STYLE_METADATA: (.*?) -->', content)
+                if style_match:
+                    try:
+                        metadata = json.loads(style_match.group(1))
+                        for style in metadata.get('inline_styles', []):
+                            all_styles.add(style.strip())
+                    except: pass
+                
+                # 清理内容
+                fragment = re.sub(r'<!-- STYLE_METADATA: .*? -->', '', content, flags=re.DOTALL)
+                fragment = re.sub(r'<style\b[^>]*>[\s\S]*?<\/style>', '', fragment, flags=re.IGNORECASE)
+                fragment = re.sub(r'<script\b[^>]*>[\s\S]*?<\/script>', '', fragment, flags=re.IGNORECASE)
+                fragment = re.sub(r'<link\b[^>]*>', '', fragment, flags=re.IGNORECASE)
+                fragment = re.sub(r'<meta\b[^>]*>', '', fragment, flags=re.IGNORECASE)
+                fragment = re.sub(r'<title\b[^>]*>[\s\S]*?<\/title>', '', fragment, flags=re.IGNORECASE)
+                
+                # 包裹在带 ID 的 div 中
+                block = f'<div class="page-section" id="content_{node_id}">\n{fragment}\n</div>'
+                content_blocks.append(block)
             
-            # 移除 style, script, link, meta, title
-            # 因为我们已经提取了 style，剩下的就是纯内容
-            fragment = re.sub(r'<style\b[^>]*>[\s\S]*?<\/style>', '', content, flags=re.IGNORECASE)
-            fragment = re.sub(r'<script\b[^>]*>[\s\S]*?<\/script>', '', fragment, flags=re.IGNORECASE)
-            fragment = re.sub(r'<link\b[^>]*>', '', fragment, flags=re.IGNORECASE)
-            fragment = re.sub(r'<meta\b[^>]*>', '', fragment, flags=re.IGNORECASE)
-            fragment = re.sub(r'<title\b[^>]*>[\s\S]*?<\/title>', '', fragment, flags=re.IGNORECASE)
-            fragment = re.sub(r'<div id="MathJax_Message"[^>]*>.*?<\/div>', '', fragment, flags=re.IGNORECASE)
-            
-            bodies.append(f'<!-- START: {filename} -->\n<div class="page-section" id="{filename}">\n{fragment}\n</div>\n<!-- END: {filename} -->')
-        except Exception as e:
-            print(f"⚠️ 处理文件 {filename} 失败: {e}")
+            if node.get('children'):
+                content_blocks.extend(process_nodes_for_content(node['children']))
+        return content_blocks
+
+    bodies = process_nodes_for_content(nav_structure)
+    
+    # 如果 nav_structure 为空（例如旧模式），则回退到简单的文件遍历
+    if not bodies and files_content:
+        print("⚠️ 使用回退模式聚合页面...")
+        for filename in sorted(files_content.keys()):
+            content = files_content[filename]
+            # ... (同样的清理逻辑) ...
+            fragment = re.sub(r'<!-- STYLE_METADATA: .*? -->', '', content, flags=re.DOTALL)
+            fragment = re.sub(r'<style\b[^>]*>[\s\S]*?<\/style>', '', fragment, flags=re.IGNORECASE)
+            # ...
+            bodies.append(f'<div class="page-section" id="{filename}">\n{fragment}\n</div>')
 
     style_block = '\n'.join([f'<style>{s}</style>' for s in all_styles])
     
+    # 生成侧边栏 HTML
+    sidebar_html = render_sidebar_html(nav_structure)
+    # 修正：最外层 ul 应该是 active 的
+    sidebar_html = sidebar_html.replace('<ul class="nested">', '<ul class="nested active">', 1)
+
+    # CSS 和 JS (借鉴 nx_fbm_scraper9.js)
+    ui_css = """
+    <style>
+        body { display: flex; height: 100vh; margin: 0; overflow: hidden; font-family: "Segoe UI", Arial, sans-serif; background-color: #f9f9f9; }
+        
+        /* 侧边栏 */
+        aside { 
+            width: 300px; 
+            min-width: 200px; 
+            max-width: 600px; 
+            overflow-y: auto; 
+            padding: 15px 10px; 
+            background: #f0f0f0; 
+            flex-shrink: 0; 
+            border-right: 1px solid #ccc; 
+            display: flex;
+            flex-direction: column;
+        }
+        
+        /* 调整器 */
+        #resizer { width: 5px; cursor: col-resize; background: #ddd; height: 100%; flex-shrink: 0; transition: background 0.2s; }
+        #resizer:hover { background: #aaa; }
+        
+        /* 主内容区 */
+        main { flex: 1; overflow-y: auto; background: #fff; scroll-behavior: smooth; padding: 0; position: relative; }
+        .content-wrapper { max-width: 1000px; margin: 0 auto; padding: 40px; background: #fff; min-height: 100%; }
+        
+        /* 目录树样式 */
+        aside ul { list-style: none; margin: 0; padding: 0; }
+        aside li { margin: 2px 0; padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        ul.nested { display: none; padding-left: 16px; }
+        ul.active { display: block; }
+        
+        .caret { cursor: pointer; display: inline-block; width: 18px; text-align: center; user-select: none; color: #666; }
+        .caret::before { content: "▶"; font-size: 10px; display: inline-block; transition: transform 0.2s; }
+        .caret-down::before { transform: rotate(90deg); }
+        .no-caret { display: inline-block; width: 18px; }
+        
+        aside a { text-decoration: none; color: #333; font-size: 14px; padding: 4px 6px; display: inline-block; border-radius: 3px; transition: background 0.1s; }
+        aside a:hover { background: #e0e0e0; color: #000; }
+        .selected-link { background: #005f87 !important; color: #fff !important; }
+        .nav-text { color: #666; font-size: 14px; padding: 4px 6px; }
+
+        /* 页面章节 */
+        .page-section { margin-bottom: 50px; padding-bottom: 30px; border-bottom: 1px solid #eee; }
+        
+        /* 表格和图片样式修复 */
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+        th { background-color: #f5f5f5; font-weight: bold; }
+        img { max-width: 100%; height: auto; }
+    </style>
+    """
+
+    ui_js = """
+    <script>
+        function toggleNode(span) { 
+            var ul = span.parentElement.querySelector(".nested"); 
+            if (ul) { 
+                ul.classList.toggle("active"); 
+                span.classList.toggle("caret-down"); 
+            } 
+        }
+        
+        function handleManualClick(a) {
+            document.querySelectorAll(".selected-link").forEach(l => l.classList.remove("selected-link"));
+            a.classList.add("selected-link");
+        }
+        
+        // 拖拽调整宽度
+        window.onload = function() {
+            const resizer = document.getElementById('resizer'); 
+            const sidebar = document.querySelector('aside'); 
+            let isResizing = false;
+            
+            resizer.addEventListener('mousedown', (e) => { 
+                isResizing = true; 
+                document.body.style.cursor = 'col-resize';
+                e.preventDefault();
+            });
+            
+            document.addEventListener('mousemove', (e) => { 
+                if (isResizing) { 
+                    let newWidth = e.clientX;
+                    if (newWidth > 150 && newWidth < 800) {
+                        sidebar.style.width = newWidth + 'px'; 
+                    }
+                } 
+            });
+            
+            document.addEventListener('mouseup', () => { 
+                isResizing = false; 
+                document.body.style.cursor = 'default';
+            });
+        }
+    </script>
+    """
+
     final_html = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>Aggregated Siemens Docs</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        /* 基础重置，但尽量不干扰原网页样式 */
-        body {{ 
-            font-family: "Segoe UI", Arial, sans-serif; 
-            margin: 0; 
-            padding: 20px;
-            background-color: #f9f9f9;
-        }}
-        
-        /* 页面章节分隔，不限制宽度，让内容自然流式排布 */
-        .page-section {{ 
-            margin-bottom: 40px; 
-            border-bottom: 1px solid #ccc; 
-            padding-bottom: 40px; 
-            background-color: #fff;
-            /* 移除 max-width 和 box-shadow，回归朴素 */
-        }}
-        
-        /* 仅防止图片溢出视口，不强制居中或改变尺寸 */
-        img {{ 
-            max-width: 100%; 
-            height: auto; 
-        }}
-        
-        /* 简单的链接样式 */
-        a {{ color: #005f87; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-    </style>
+    {ui_css}
     {style_block}
 </head>
 <body>
-    <h1 style="text-align: center; margin-bottom: 40px;">Aggregated Siemens Documentation</h1>
-    {''.join(bodies)}
+    <aside>
+        <h3 style="padding-left: 10px; margin-top: 0;">Contents</h3>
+        {sidebar_html}
+    </aside>
+    <div id="resizer"></div>
+    <main>
+        <div class="content-wrapper">
+            <h1 style="text-align: center; margin-bottom: 40px; border-bottom: 2px solid #005f87; padding-bottom: 20px;">Siemens Documentation</h1>
+            {''.join(bodies)}
+        </div>
+    </main>
+    {ui_js}
 </body>
 </html>
     """
@@ -473,7 +736,7 @@ def aggregate_saved_pages(pages_dir, out_file):
     try:
         with open(out_file, 'w', encoding='utf-8') as f:
             f.write(final_html)
-        print(f"✅ 聚合完成！已将 {len(bodies)} 个页面合并到 {out_file}")
+        print(f"✅ 聚合完成！已生成带侧边栏的文档: {out_file}")
     except Exception as e:
         print(f"❌ 写入聚合文件失败: {e}")
 
@@ -481,7 +744,7 @@ def aggregate_saved_pages(pages_dir, out_file):
 def main():
     # --- 交互提示 ---
     print("="*50)
-    print("西门子文档抓取工具")
+    print("西门子文档抓取工具 (Enhanced)")
     print("="*50)
     
     choice = input("请选择操作模式: [c]继续下载(默认) / [r]重新下载: ").strip().lower()
@@ -512,19 +775,35 @@ def main():
 
             expand_all_tree_nodes(nav_frame, selector_hint)
             
-            nav_links = collect_nav_links(nav_frame, selector_hint)
-
-            if not nav_links:
-                print("❌ 未能收集到任何导航链接，无法继续。脚本将退出。")
+            # 获取树状结构
+            tree_data = collect_nav_tree(nav_frame, selector_hint)
+            
+            if not tree_data:
+                print("❌ 未能收集到导航树，尝试回退到旧方法...")
+                # 这里可以加回退逻辑，但为了简洁先报错
                 return
 
-            harvest_and_aggregate(context, nav_links, URL, resume=resume)
+            # 处理树结构，生成下载列表
+            download_list, processed_tree = process_tree_and_flatten(tree_data)
+            
+            # 保存导航结构供聚合使用
+            with open(NAV_FILE, "w", encoding="utf-8") as f:
+                json.dump(processed_tree, f, indent=2)
+            print(f"✅ 导航结构已保存到 {NAV_FILE}")
+
+            if not download_list:
+                print("❌ 没有发现有效的下载链接。")
+                return
+
+            harvest_and_aggregate(context, download_list, resume=resume)
 
             with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"status": "success", "url": URL, "pages_found": len(nav_links)}, f, indent=2)
+                json.dump({"status": "success", "url": URL, "pages_found": len(download_list)}, f, indent=2)
 
         except Exception as e:
             print(f"❌ 主流程发生严重错误: {e}")
+            import traceback
+            traceback.print_exc()
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump({"status": "error", "message": str(e)}, f, indent=2)
         finally:
