@@ -299,7 +299,7 @@ async def process_page(i, title, url, has_href, context, sem, stats, progress, m
                         else:
                             raise Exception("DIRECTORY_NODE_SKIPPED")
 
-                await page.wait_for_timeout(1500)
+                # 依赖evaluate内部的智能等待机制
 
                 cookie_buttons = [
                     'button:has-text("接受所有Cookie")', 'button:has-text("Accept all cookies")',

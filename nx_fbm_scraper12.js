@@ -1,5 +1,5 @@
 // ==========================================================
-// NX2506 文档抓取器 (V121 - 样式完全恢复版)
+// NX12 文档抓取器 (V121 - 样式完全恢复版)
 // 核心革命：
 // 1. [纯数据库] 彻底抛弃本地 HTML 碎片文件，所有内容直接存取 SQLite。
 // 2. [真·续传] 任务开始前先查库，存在即跳过，0 IO 消耗，秒级恢复进度。
@@ -23,14 +23,15 @@ const sqlite3 = require("sqlite3").verbose();
 // ==========================================
 // ⚙️ 全局配置区
 // ==========================================
+const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.postbuilder/mainmenu_post_postproc_v1";
 // const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/feat_based_mach_fbm_overview";
-const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/feat_based_mach_fbm_overview";
-const FINAL_OUTPUT_FILE = "NX2506基于特征加工-js.html";
-const CACHE_DIR_NAME = "NX2506_pages"; // 仅用于存放 CSS 文件
-const SIDEBAR_TITLE = "NX2506&nbsp;&nbsp;基于特征加工";
-const MAX_CONCURRENCY = 5; // 保持较低并发以稳定运行
-const NAV_JSON_FILE = "NX2506_nav_structure.json";
-const CACHE_DB_FILE = "NX2506_pages.db";
+// const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/feat_based_mach_fbm_overview";
+const FINAL_OUTPUT_FILE = "NX12后处理构造器-js.html";
+const CACHE_DIR_NAME = "NX12_pages"; // 仅用于存放 CSS 文件
+const SIDEBAR_TITLE = "NX12&nbsp;&nbsp;后处理构造器";
+const MAX_CONCURRENCY = 9; // 保持较低并发以稳定运行
+const NAV_JSON_FILE = "NX12_nav_structure.json";
+const CACHE_DB_FILE = "NX12_pages.db";
 
 const CACHE_DIR = path.join(__dirname, CACHE_DIR_NAME);
 const TARGET_IFRAME_SELECTOR = "#xhtml";

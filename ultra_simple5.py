@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
 """
-NX文档聚合器 - 终极完全体 (v10.0 上帝模式：池化引擎+SQLite缓存)
+NX文档聚合器 - 终极完全体 (v11.21 修复版：增加变更标记)
 核心优化:
+
 1. 完美应用用户自定义的全局配置参数 (NX12/2506 通用)。
 2. 彻底修复侧边栏双重斑马线，加入4px极限缩进、#888单竖线、西门子深蓝字体。
 3. 全词库无死角底部垃圾清理 + OOM 防爆流式写入硬盘。
 4. [新增] 页面池化 (Page Pooling)：不再频繁开闭标签页，极致压榨 CPU 性能。
 5. [新增] SQLite 数据库缓存：消灭海量碎文件，单库秒级读写。
+6. [新增] 默认展开首层目录，提升阅读体验。
+7. [新增] 优化选中目录项的背景色，提高文字可读性。
+8. [新增] 将正文主标题颜色设为主题蓝，与侧边栏标题呼应。
+9. [修复] 无论是否有内容，强制生成 HTML 文件，避免静默失败。
+10. [修复] 彻底移除所有针对表格的强制样式，完全依赖页面自带 CSS。
+11. [修复] 恢复内容容器回退机制，解决 DOM_CONTAINER_NOT_FOUND 错误。
+12. [修复] 增强网络拦截，屏蔽字体和 websocket。
+13. [修复] 重构并优化续传逻辑，确保失败的页面能够被重新下载。
+14. [优化] 固定侧边栏标题，使其不随目录滚动。
+15. [修复] 回归 ultra_simple4.py 的抓取逻辑（优先查找 div.doc-content），并保留强力清洗功能。
+16. [优化] 明确设置正文主标题的字体大小。
+17. [新增] 自动检测并清洗数据库中的脏数据（包含侧边栏的页面），强制重抓。
+18. [新增] 启动时自动压缩数据库 (VACUUM) 并打印数据统计信息。19. [重构] 数据库结构升级：CSS 独立去重存储，数据库体积缩减 90%！
+20. [新增] 每次改动追加 REV 标记，便于回退定位。
 """
+
+# 变更标记（每次改动请追加一条，勿修改历史）
+# [REV 2026-02-18 #01] 抓取：优先使用 frameDoc 的 div.doc-content 克隆，清理 header/navbar/breadcrumb；表格：保留 locator 的 col/colgroup 宽度；CSS：增加去重命中调试输出。
+
 
 import asyncio
 from playwright.async_api import async_playwright
@@ -26,7 +45,7 @@ import sqlite3
 START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/feat_based_mach_fbm_overview";
 # START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/feat_based_mach_fbm_overview"
 
-FINAL_OUTPUT_FILE = "NX12基于特征加工.html"  # 最终生成的单文件 HTML 名称
+FINAL_OUTPUT_FILE = "NX12基于特征加工-py.html"  # 最终生成的单文件 HTML 名称
 CACHE_DB_FILE = "NX12_pages.db"  # 🚀 升级为 SQLite 数据库文件
 SIDEBAR_TITLE = "NX12&nbsp;&nbsp;基于特征加工"  # 侧边栏大标题 (&nbsp;代表空格)
 MAX_CONCURRENCY = 5  # 🚀 并发线程数量 (推荐: 极速设5，防封锁设2)
@@ -154,10 +173,8 @@ def generate_tree_navigation(nav_structure, valid_indices, duplicate_map):
 
     def build_tree_html(nodes, level=0):
         if not nodes: return ""
-        if level == 0:
-            html = '<ul class="root-list active">\n'
-        else:
-            html = '<ul class="nested">\n'
+        # 优化点：根UL默认展开
+        html = '<ul class="root-list active">\n' if level == 0 else '<ul class="nested">\n'
 
         for node in nodes:
             text = node.get('text', 'Untitled')
@@ -170,7 +187,9 @@ def generate_tree_navigation(nav_structure, valid_indices, duplicate_map):
             html += f'    <li class="nav-level-{level}">\n'
             html += '        <div class="nav-item-row">\n'
             if has_children and children:
-                html += f'            <span class="caret caret-down" onclick="toggleNode(this)"></span>\n'
+                # 优化点：首层目录的箭头默认向下
+                caret_class = "caret caret-down" if level == 0 else "caret"
+                html += f'            <span class="{caret_class}" onclick="toggleNode(this)"></span>\n'
             else:
                 html += '            <span class="no-caret"></span>\n'
 
@@ -188,7 +207,11 @@ def generate_tree_navigation(nav_structure, valid_indices, duplicate_map):
             html += '        </div>\n'
 
             if has_children and children:
-                html += build_tree_html(children, level + 1)
+                sub_html = build_tree_html(children, level + 1)
+                # 优化点：首层目录的子菜单默认展开
+                if level == 0:
+                    sub_html = sub_html.replace('<ul class="nested">', '<ul class="nested active">', 1)
+                html += sub_html
             html += '    </li>\n'
         return html + '</ul>\n'
 
@@ -199,6 +222,11 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                        seen_hashes, seen_css_hashes, global_styles, contents_dict, valid_indices, duplicate_map):
     if stats.interrupted: return
 
+    # ==================================================================
+    # 续传逻辑重构 (v11.8)
+    # ==================================================================
+
+    # 1. 首先处理纯目录外壳，这种节点没有内容，直接跳过并标记为完成
     if not has_href and (not url.strip() or 'javascript' in url.lower() or url.startswith('#')):
         print(f"   ℹ️ [{i + 1}] {title} (📁 纯目录外壳，自动跳过)")
         async with lock:
@@ -208,52 +236,65 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
             if stats.processed_pages % 10 == 0: save_progress(progress)
         return
 
-    skip_reason = ""
+    # 2. 检查是否已在 'completed' 列表且数据库中有缓存
+    is_completed = False
     async with lock:
         if title in progress['completed']:
-            skip_reason = "已完成"
+            is_completed = True
 
-    if skip_reason == "已完成":
+    if is_completed:
         cached_content = None
         cached_css = None
         try:
-            # 🗄️ 从 SQLite 极速读取缓存
             async with lock:
-                row = db_conn.execute("SELECT html, css FROM cache WHERE title=?", (title,)).fetchone()
-            if row:
-                cached_content, cached_css = row
+                # 🚀 升级：从 cache 表读取 html 和 css_hash，然后从 styles 表读取 css
+                row = db_conn.execute("SELECT html, css_hash FROM cache WHERE title=?", (title,)).fetchone()
+                if row:
+                    cached_content, css_hash = row
+                    if css_hash:
+                        style_row = db_conn.execute("SELECT content FROM styles WHERE hash=?", (css_hash,)).fetchone()
+                        if style_row:
+                            cached_css = style_row[0]
         except Exception:
             pass
 
         if cached_content:
-            content_hash = hashlib.md5(cached_content.encode()).hexdigest()
-            async with lock:
-                if content_hash not in seen_hashes:
-                    seen_hashes[content_hash] = i
-                    contents_dict[i] = f"<div class=\"page-section\" id=\"page_{i}\">{cached_content}</div>"
-                    valid_indices.add(i)
+            # 修复点：检查缓存是否脏了 (包含侧边栏)
+            if 'doc-sidebar' in cached_content or 'id="doc-sidebar"' in cached_content:
+                print(f"   ⚠️ [{i + 1}] {title} (缓存包含侧边栏，视为脏数据，强制重抓)")
+                cached_content = None  # 标记为无效，触发重抓
+            else:
+                content_hash = hashlib.md5(cached_content.encode()).hexdigest()
+                async with lock:
+                    if content_hash not in seen_hashes:
+                        seen_hashes[content_hash] = i
+                        contents_dict[i] = f"<div class=\"page-section\" id=\"page_{i}\">{cached_content}</div>"
+                        valid_indices.add(i)
 
-                    if cached_css:
-                        css_hash = hashlib.md5(cached_css.encode()).hexdigest()
-                        if css_hash not in seen_css_hashes:
-                            global_styles.append(cached_css)
-                            seen_css_hashes.add(css_hash)
+                        if cached_css:
+                            css_hash = hashlib.md5(cached_css.encode()).hexdigest()
+                            if css_hash not in seen_css_hashes:
+                                global_styles.append(cached_css)
+                                seen_css_hashes.add(css_hash)
+                            else:
+                                # 调试：CSS 去重命中（可能存在误杀/过度去重）
+                                print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
 
-                    stats.success_count += 1
-                    print(f"[{i + 1}] {title} (✓ 数据库极速恢复)")
-                else:
-                    duplicate_map[i] = seen_hashes[content_hash]
-                    stats.redundant_count += 1
-                    print(f"[{i + 1}] {title} (🔗 缓存映射复用)")
-                stats.processed_pages += 1
-            return
-        else:
-            skip_reason = ""
+                        stats.success_count += 1
+                        print(f"[{i + 1}] {title} (✓ 数据库极速恢复)")
+                    else:
+                        duplicate_map[i] = seen_hashes[content_hash]
+                        stats.redundant_count += 1
+                        print(f"[{i + 1}] {title} (🔗 缓存映射复用)")
+                    stats.processed_pages += 1
+                return
 
-    if skip_reason:
-        async with lock: stats.processed_pages += 1
-        return
-
+    # 如果代码执行到这里，意味着：
+    # - 这是一个新页面
+    # - 这是一个之前失败的页面 (不在 'completed' 列表里)
+    # - 这是一个在 'completed' 列表里但缓存丢失的页面
+    # - 这是一个缓存脏了的页面
+    # 无论哪种情况，都需要重新抓取。
     print(f"[{i + 1}] 🚀 开始提取: {title}")
 
     # 🚀 从池中获取一个空闲的页面实例 (代替昂贵的 new_page)
@@ -284,7 +325,7 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                         else:
                             raise Exception("DIRECTORY_NODE_SKIPPED")
 
-                await page.wait_for_timeout(1500)
+                # await page.wait_for_timeout(1500)  # 已删除：这个1.5秒死等严重影响性能
 
                 cookie_buttons = [
                     'button:has-text("接受所有Cookie")', 'button:has-text("Accept all cookies")',
@@ -320,6 +361,7 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
 
                         while(retries > 0) {
                             frameDoc = getDoc();
+                            // 修复点：回归 ultra_simple4.py 的查找逻辑
                             container = frameDoc.querySelector('div.doc-content') || 
                                         frameDoc.querySelector('.main.content-container') || 
                                         frameDoc.querySelector('#content');
@@ -333,7 +375,9 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                             retries--;
                         }
 
-                        if (!container || container === document.body) throw new Error("DOM_CONTAINER_NOT_FOUND");
+                        // 修复点：回归 ultra_simple4.py 的回退逻辑
+                        if (!container) container = frameDoc.body;
+                        if (!container) throw new Error("DOM_CONTAINER_NOT_FOUND");
 
                         let finalLen = container.innerText.replace(/\s+/g, '').length;
                         if (finalLen < 15) throw new Error("REAL_TEXT_TOO_SHORT");
@@ -362,7 +406,27 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                             } catch (e) {}
                         }
 
-                        const clone = container.cloneNode(true);
+                        // 只抓正文内容：优先抓 frameDoc 内的 .doc-content（避免把站点顶栏/侧栏一起抓进来）
+                        const clone = (frameDoc.querySelector("div.doc-content") || container).cloneNode(true);
+
+                        // 修复点：保留强力清洗逻辑，以防万一回退到 body 时抓到了侧边栏
+                        const unwantedSelectors = [
+                            // 站点/页面级顶栏、导航等（离线文档不需要）
+                            'header', '.navbar', '.site-header', '.topbar', '.app-header',
+                            '.breadcrumb', '.breadcrumbs', '.global-nav', '.nav-header',
+                            '.doc-sidebar', '#doc-sidebar', 
+
+                            '#topic-navigator', 
+                            '.hidden-md-up', 
+                            '#feedback-btns', 
+                            '.gutter',
+                            '.doc-main-contents > div.hidden-md-up'
+                        ];
+
+                        unwantedSelectors.forEach(sel => {
+                            const els = clone.querySelectorAll(sel);
+                            els.forEach(el => el.remove());
+                        });
 
                         const footerKeywords = [
                             'Learn more', 'How do I', 'Look up more details', 'See also', 'See Also',
@@ -390,9 +454,15 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                         });
 
                         const baseUrl = frameDoc.baseURI || document.baseURI;
+
                         clone.querySelectorAll('*').forEach(el => {
-                            if (el.tagName.toLowerCase() === 'table' || el.tagName.toLowerCase() === 'colgroup' || el.tagName.toLowerCase() === 'col') el.removeAttribute('width');
+
+                              // 保留 locator 表格的 colgroup/col width（维持列宽），但清理其它表格的 width 避免被撑满
+                            const tag = el.tagName.toLowerCase();
+                            if (tag === 'table' && !el.classList.contains('locator')) el.removeAttribute('width');
+                            if ((tag === 'colgroup' || tag === 'col') && !(el.closest && el.closest('table.locator'))) el.removeAttribute('width');
                             if (el.hasAttribute('src')) try { el.src = new URL(el.getAttribute('src'), baseUrl).href; } catch(e) {}
+
                             if (el.hasAttribute('href')) try { el.href = new URL(el.getAttribute('href'), baseUrl).href; } catch(e) {}
                             if (el.hasAttribute('style')) {
                                 let cleanStyle = el.getAttribute('style').replace(/url\(['"]?data:image\/[^)]+['"]?\)/gi, 'none');
@@ -447,6 +517,16 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                         if css_hash not in seen_css_hashes:
                             global_styles.append(extracted_css)
                             seen_css_hashes.add(css_hash)
+                        else:
+
+                            # 调试：CSS 去重命中（可能存在误杀/过度去重）
+                            print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
+
+                        try:
+                            db_conn.execute("INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)",
+                                            (css_hash, extracted_css))
+                        except:
+                            pass
 
                     stats.success_count += 1
                     print(f"[{i + 1}] {title} (✓ 抓取成功) | {stats.get_progress_info()}")
@@ -454,10 +534,10 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                 if title in progress['failed']: progress['failed'].remove(title)
                 if title not in progress['completed']: progress['completed'].append(title)
 
-                # 🗄️ 将成功抓取的数据写入 SQLite 缓存库
                 try:
-                    db_conn.execute("REPLACE INTO cache (title, html, css) VALUES (?, ?, ?)",
-                                    (title, extracted_data, extracted_css))
+                    css_hash_val = hashlib.md5(extracted_css.encode('utf-8')).hexdigest() if extracted_css else ""
+                    db_conn.execute("REPLACE INTO cache (title, html, css_hash) VALUES (?, ?, ?)",
+                                    (title, extracted_data, css_hash_val))
                     db_conn.commit()
                 except Exception as e:
                     print(f"写入数据库失败: {e}")
@@ -466,7 +546,6 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
             if stats.processed_pages % 10 == 0: save_progress(progress)
 
     finally:
-        # 🚀 无论成功失败，将处理完的 Page 归还给连接池
         await page_pool.put(page)
 
 
@@ -484,7 +563,7 @@ async def main():
     lock = asyncio.Lock()
 
     print("=" * 50)
-    print("🚀 NX文档聚合器 - 终极全自动版 (v10.0 上帝模式)")
+    print("🚀 NX文档聚合器 - 终极全自动版 (v11.20 修复版：彻底移除表格样式)")
     print("=" * 50)
     print("[a] 全自动一键探测 (探测结构 + 并发抓取)")
     print("[c] 增量续传模式 (基于现有 SQLite 恢复)")
@@ -499,10 +578,45 @@ async def main():
         if os.path.exists('progress.json'): os.remove('progress.json')
         if os.path.exists(NAV_JSON_FILE): os.remove(NAV_JSON_FILE)
 
-    # 🗄️ 初始化 SQLite 数据库
+    # 🗄️ 初始化 SQLite 数据库 (升级表结构)
     db_conn = sqlite3.connect(CACHE_DB_FILE, check_same_thread=False)
-    db_conn.execute("CREATE TABLE IF NOT EXISTS cache (title TEXT PRIMARY KEY, html TEXT, css TEXT)")
+
+    # 检查表结构是否需要迁移 (简单起见，如果表存在但结构不对，建议用户选 r 重抓)
+    # 这里我们直接创建新表结构。如果旧表存在且结构不同，可能会报错。
+    # 为了稳健，我们尝试创建 styles 表。
+    db_conn.execute("CREATE TABLE IF NOT EXISTS styles (hash TEXT PRIMARY KEY, content TEXT)")
+
+    # 检查 cache 表是否有 css_hash 列。如果没有，说明是旧版数据库。
+    # 简单处理：如果用户选 c 但数据库是旧版，可能会出错。
+    # 建议：如果数据库存在，检查表结构。
+    try:
+        db_conn.execute("SELECT css_hash FROM cache LIMIT 1")
+    except sqlite3.OperationalError:
+        # 列不存在，说明是旧版数据库。
+        if mode == 'c' and os.path.exists(CACHE_DB_FILE):
+            print("⚠️ 检测到旧版数据库结构，正在自动迁移数据...")
+            # 简单的迁移策略：重命名旧表，创建新表，尝试迁移数据（CSS 哈希化）
+            # 但这比较复杂。最简单的策略是：提示用户重抓。
+            # 或者，我们直接 drop table cache 并重建，强制重抓。
+            print("⚠️ 旧版数据库无法直接兼容 CSS 去重特性，将清除旧缓存并强制重抓。")
+            db_conn.execute("DROP TABLE IF EXISTS cache")
+            mode = 'r'  # 强制转为重抓模式
+
+    db_conn.execute("CREATE TABLE IF NOT EXISTS cache (title TEXT PRIMARY KEY, html TEXT, css_hash TEXT)")
+
+    # 🚀 数据库诊断与优化
+    print("🧹 正在执行数据库 VACUUM 压缩...")
+    db_conn.execute("VACUUM")
     db_conn.commit()
+
+    try:
+        cursor = db_conn.execute("SELECT count(*), avg(length(html)), max(length(html)) FROM cache")
+        row = cursor.fetchone()
+        if row and row[0] > 0:
+            print(
+                f"📊 数据库统计: {row[0]} 条记录 | 平均 HTML 大小: {int(row[1] or 0)} 字节 | 最大 HTML 大小: {int(row[2] or 0)} 字节")
+    except Exception as e:
+        print(f"⚠️ 无法获取数据库统计: {e}")
 
     progress = load_progress()
     if mode == "r":
@@ -516,7 +630,7 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            viewport={'width': 1280, 'height': 960},
+            viewport={'width': 1440, 'height': 960},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
 
@@ -549,10 +663,11 @@ async def main():
         flatten(nav_structure)
         stats.total_pages = len(pages)
 
-        # 🚀 极限网络断流拦截优化：精准屏蔽多余字体与无用长连接
+        #  极限网络断流拦截优化：保留图片，精准狙击西门子的遥测和追踪分析脚本
         async def route_intercept(route):
             block_types = ["media", "beacon", "csp_report"]
-            if route.request.resource_type in block_types:
+            url = route.request.url.lower()
+            if route.request.resource_type in block_types or "analytics" in url or "tracking" in url or "tealium" in url or "metrics" in url:
                 await route.abort()
             else:
                 await route.continue_()
@@ -593,13 +708,13 @@ async def main():
         db_conn.close()
 
         # 🛡️ OOM 内存防爆：流式写入合成最终 HTML
-        if contents_dict:
-            print("⏳ 正在合成并流式写入最终 HTML...")
-            tree_html = generate_tree_navigation(nav_structure, valid_indices, duplicate_map)
-            combined_css = "\n".join(global_styles)
+        # 修复：移除 if contents_dict: 判断，强制执行写入逻辑
+        print(f"⏳ 正在合成并流式写入最终 HTML (包含 {len(contents_dict)} 个页面)...")
+        tree_html = generate_tree_navigation(nav_structure, valid_indices, duplicate_map)
+        combined_css = "\n".join(global_styles)
 
-            with open(FINAL_OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                f.write(f"""<!DOCTYPE html>
+        with open(FINAL_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            f.write(f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -608,11 +723,21 @@ async def main():
     <style>
         body {{ display: flex; height: 100vh; margin: 0; overflow: hidden; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; color: #333; }}
 
-        .nx-sidebar {{ width: 340px; min-width: 250px; overflow-y: auto; padding: 15px 5px; background: #f8f9fa; border-right: 1px solid #dee2e6; }}
+        .nx-sidebar {{ width: 340px; min-width: 250px; display: flex; flex-direction: column; background: #f8f9fa; border-right: 1px solid #dee2e6; }}
+
+        .nx-sidebar-header {{ padding: 15px 10px; background: #f8f9fa; border-bottom: 2px solid #007cba; flex-shrink: 0; }}
+        .nx-sidebar-content {{ flex: 1; overflow-y: auto; padding: 5px; }}
+
         .resizer {{ width: 5px; cursor: col-resize; background: #dee2e6; transition: background 0.2s; }}
         .resizer:hover {{ background: #007cba; }}
         .main-content {{ flex: 1; overflow-y: auto; scroll-behavior: smooth; padding: 0; background: #fff; line-height: 1.6; }}
-        .content-wrapper {{ max-width: 1200px; margin: 0 auto; padding: 40px; }}
+        .content-wrapper {{ max-width: 100%; margin: 0 auto; padding: 40px; }}
+
+        /* 优化点：统一正文主标题颜色 */
+        .content-wrapper h1 {{ font-size: 32px !important; color: #007cba !important; font-weight: bold; margin-bottom: 15px; }}
+        .content-wrapper h2 {{ color: #007cba !important; }}
+
+        /* 修复点：彻底移除所有针对表格的强制样式，完全依赖页面自带 CSS */
 
         .nx-sidebar ul, .nx-sidebar ul.root-list {{ list-style: none; margin: 0; padding: 0; }}
         .nx-sidebar li {{ margin: 2px 0; padding: 0; }}
@@ -661,26 +786,28 @@ async def main():
         .nav-level-5 > .nav-item-row > a, .nav-level-5 > .nav-item-row > span.nav-text {{ font-size: 12px; }}
 
         .nx-sidebar a:hover, .folder-text:hover {{ background: #e2e8f0; color: #005a84; }}
-        .selected-link {{ background: #005a84 !important; color: #fff !important; font-weight: 600 !important; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }}
+        /* 优化点：调整选中目录项的背景色 */
+        .selected-link {{ background: #ADD8E6 !important; color: #000 !important; font-weight: 600 !important; }}
 
         .page-section {{ margin-bottom: 80px; padding-top: 30px; border-top: 2px solid #eaeaea; }}
         .page-section:first-child {{ border-top: none; padding-top: 0; }}
-        .page-section h1.title {{ font-size: 28px; color: #005a84; margin-top: 0; padding-bottom: 10px; border-bottom: 1px solid #eee; }}
     </style>
 </head>
 <body>
     <div class="nx-sidebar">
-        <h3 style="color: #007cba; border-bottom: 2px solid #007cba; padding-bottom: 10px; margin: 0 10px 10px 10px; text-align: center; font-size: 24px;">{SIDEBAR_TITLE}</h3>
-        <div>{tree_html}</div>
+        <div class="nx-sidebar-header">
+            <h3 style="color: #007cba; margin: 0; text-align: center; font-size: 24px;">{SIDEBAR_TITLE}</h3>
+        </div>
+        <div class="nx-sidebar-content">{tree_html}</div>
     </div>
     <div class="resizer" id="resizer"></div>
     <div class="main-content">
         <div class="content-wrapper">
 """)
-                for k in sorted(contents_dict.keys()):
-                    f.write(contents_dict[k] + "\n")
+            for k in sorted(contents_dict.keys()):
+                f.write(contents_dict[k] + "\n")
 
-                f.write("""        </div>
+            f.write("""        </div>
     </div>
     <script>
         function toggleNode(span) {

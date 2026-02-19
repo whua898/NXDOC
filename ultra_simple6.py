@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NX文档聚合器 - 终极完全体 (v11.28 修复版：兼容 JS 版生成的 JSON 结构)
+NX文档聚合器 - 终极完全体 (v11.22 修复版：修复失败页面误判为完成的Bug)
 核心优化:
 
 1. 完美应用用户自定义的全局配置参数 (NX12/2506 通用)。
@@ -20,27 +20,16 @@ NX文档聚合器 - 终极完全体 (v11.28 修复版：兼容 JS 版生成的 J
 15. [修复] 回归 ultra_simple4.py 的抓取逻辑（优先查找 div.doc-content），并保留强力清洗功能。
 16. [优化] 明确设置正文主标题的字体大小。
 17. [新增] 自动检测并清洗数据库中的脏数据（包含侧边栏的页面），强制重抓。
-18. [新增] 启动时自动压缩数据库 (VACUUM) 并打印数据统计信息。19. [重构] 数据库结构升级：CSS 独立去重存储，数据库体积缩减 90%！
+18. [新增] 启动时自动压缩数据库 (VACUUM) 并打印数据统计信息。
+19. [重构] 数据库结构升级：CSS 独立去重存储，数据库体积缩减 90%！
 20. [新增] 每次改动追加 REV 标记，便于回退定位。
-21. [修复] 修正纯目录外壳判定逻辑，避免访问 javascript:void(0) 链接。
-22. [优化] 代码结构清理，移除重复定义，统一 LF 换行符。
-23. [增强] CSS URL 绝对化处理，与 JS 版保持一致，修复背景图路径问题。
-24. [修复] 强制使用 utf-8 读写 progress.json，解决 Windows 下的编码错误。
-25. [修复] 兼容 JS 版生成的 nav_structure.json (读取 url 字段作为 href)。
+21. [修复] 修正逻辑漏洞：只有抓取成功才写入数据库，防止失败页面被标记为完成。
+22. [修复] 增强缓存校验：内容过短（<50字符）视为无效，强制重抓。
 """
 
 # 变更标记（每次改动请追加一条，勿修改历史）
+# [REV 2026-02-18 #02] 逻辑修复：将数据库写入和进度更新移入 if success 块内；增加缓存内容长度校验。
 
-# [REV 2026-02-18 #01] 抓取：优先使用 frameDoc 的 div.doc-content 克隆，清理 header/navbar/breadcrumb；表格：保留 locator 的 col/colgroup 宽度；CSS：增加去重命中调试输出。
-# [REV 2026-02-18 #02] 表格：避免离线页面表格被压缩换行，仅对 locator 表格启用横向滚动兜底（不改原站点列宽定义）。
-# [REV 2026-02-18 #03] 调试：抓取时统计正文中 table 类型签名，输出 table_report.json/txt（用于定位哪些表格需要额外 CSS 兜底）。
-# [REV 2026-02-19 #04] 修复：修正纯目录外壳判定逻辑，正确跳过 javascript:void(0) 链接。
-# [REV 2026-02-19 #05] 清理：移除重复函数定义，统一行尾为 LF。
-# [REV 2026-02-19 #06] 修复：修正 update_table_report 函数中的缩进错误和垃圾字符。
-# [REV 2026-02-19 #07] 样式：根据 table_report 优化表格 CSS，覆盖 no-class, navigator, locator 三种类型。
-# [REV 2026-02-19 #08] 增强：添加 cssTextToAbsoluteUrls 函数，修复 CSS 中的相对路径。
-# [REV 2026-02-19 #09] 修复：load_progress 和 save_progress 强制使用 utf-8 编码。
-# [REV 2026-02-19 #10] 修复：flatten 函数优先读取 'url' 字段，兼容 JS 版生成的 JSON。
 
 import asyncio
 from playwright.async_api import async_playwright
@@ -61,12 +50,9 @@ START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917
 
 FINAL_OUTPUT_FILE = "NX12基于特征加工-py.html"  # 最终生成的单文件 HTML 名称
 CACHE_DB_FILE = "NX12_pages.db"  # 🚀 升级为 SQLite 数据库文件
-
 SIDEBAR_TITLE = "NX12&nbsp;&nbsp;基于特征加工"  # 侧边栏大标题 (&nbsp;代表空格)
-MAX_CONCURRENCY = 9  # 🚀 并发线程数量 (推荐: 极速设5，防封锁设2)
+MAX_CONCURRENCY = 5  # 🚀 并发线程数量 (推荐: 极速设5，防封锁设2)
 NAV_JSON_FILE = "NX12_nav_structure.json"  # 目录结构 JSON 文件名
-TABLE_REPORT_JSON = "table_report.json"
-TABLE_REPORT_TXT = "table_report.txt"
 
 
 # ==========================================
@@ -90,119 +76,14 @@ class ProcessingStats:
         return f"[{pct:.1f}%] 成功:{self.success_count} 复用:{self.redundant_count} 失败:{self.failed_count} | ETA: {eta}"
 
 
-def _normalize_table_signature(sig: dict) -> str:
-    """
-    Build a stable signature key for table type aggregation.
-    """
-    classes = ",".join(sorted(sig.get("classes", []))) or "-"
-    return (
-        f"classes={classes}"
-        f"|locator={int(bool(sig.get('isLocator')))}"
-        f"|colgroup={int(bool(sig.get('hasColgroup')))}"
-        f"|thead={int(bool(sig.get('hasThead')))}"
-        f"|tbody={int(bool(sig.get('hasTbody')))}"
-        f"|rows={sig.get('rows', '?')}"
-        f"|cols={sig.get('cols', '?')}"
-    )
-
-
-def update_table_report(table_report: dict, title: str, url: str, table_sigs: list):
-    """
-    table_report structure:
-      {
-        "total_pages_with_tables": int,
-        "total_tables": int,
-        "by_signature": {
-            "<signature>": {"count": int, "examples": [{"title":..., "url":...}]}
-        },
-        "by_class": {
-            "<class>": {"count": int, "examples": [...]}
-        }
-      }
-    """
-    if not table_sigs:
-        return
-
-    table_report["total_pages_with_tables"] += 1
-    table_report["total_tables"] += len(table_sigs)
-
-    by_sig = table_report["by_signature"]
-    by_class = table_report["by_class"]
-
-    for sig in table_sigs:
-        key = _normalize_table_signature(sig)
-        if key not in by_sig:
-            by_sig[key] = {"count": 0, "examples": []}
-        by_sig[key]["count"] += 1
-        if len(by_sig[key]["examples"]) < 5:
-            by_sig[key]["examples"].append({"title": title, "url": url})
-
-        classes = sig.get("classes", []) or []
-        if not classes:
-            classes = ["(no-class)"]
-        for cls in classes:
-            if cls not in by_class:
-                by_class[cls] = {"count": 0, "examples": []}
-            by_class[cls]["count"] += 1
-            if len(by_class[cls]["examples"]) < 5:
-                by_class[cls]["examples"].append({"title": title, "url": url})
-
-
-def write_table_reports(table_report: dict):
-    # JSON
-    try:
-        with open(TABLE_REPORT_JSON, "w", encoding="utf-8") as f:
-            json.dump(table_report, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ 写入 {TABLE_REPORT_JSON} 失败: {e}")
-
-    # TXT
-    try:
-        lines = []
-        lines.append("NXDOC Table Report")
-        lines.append("=" * 60)
-        lines.append(f"pages_with_tables: {table_report.get('total_pages_with_tables', 0)}")
-        lines.append(f"total_tables:      {table_report.get('total_tables', 0)}")
-        lines.append("")
-
-        # top signatures
-        lines.append("[Top table signatures]")
-        sig_items = sorted(
-            table_report.get("by_signature", {}).items(),
-            key=lambda kv: kv[1].get("count", 0),
-            reverse=True,
-        )
-        for sig, info in sig_items[:50]:
-            lines.append(f"- {info.get('count', 0):>5}  {sig}")
-            for ex in info.get("examples", [])[:3]:
-                lines.append(f"        · {ex.get('title', '')} | {ex.get('url', '')}")
-        lines.append("")
-
-        lines.append("[Top table classes]")
-        cls_items = sorted(
-            table_report.get("by_class", {}).items(),
-            key=lambda kv: kv[1].get("count", 0),
-            reverse=True,
-        )
-        for cls, info in cls_items[:100]:
-            lines.append(f"- {info.get('count', 0):>5}  class={cls}")
-            for ex in info.get("examples", [])[:3]:
-                lines.append(f"        · {ex.get('title', '')} | {ex.get('url', '')}")
-
-        with open(TABLE_REPORT_TXT, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    except Exception as e:
-        print(f"⚠️ 写入 {TABLE_REPORT_TXT} 失败: {e}")
-
-
 def load_progress():
     if os.path.exists('progress.json'):
-        with open('progress.json', 'r', encoding='utf-8') as f: return json.load(f)
+        with open('progress.json', 'r') as f: return json.load(f)
     return {'completed': [], 'failed': []}
 
 
 def save_progress(progress):
-    with open('progress.json', 'w', encoding='utf-8') as f: json.dump(progress, f)
+    with open('progress.json', 'w') as f: json.dump(progress, f)
 
 
 async def auto_generate_nav_structure(context):
@@ -300,9 +181,8 @@ def generate_tree_navigation(nav_structure, valid_indices, duplicate_map):
 
         for node in nodes:
             text = node.get('text', 'Untitled')
+            has_children = node.get('hasChildren', False)
             children = node.get('children', [])
-            # 现在的版本：增加了一层兼容兜底！找不到 hasChildren，就去看看 children 数组里面有没有东西
-            has_children = node.get('hasChildren', len(children) > 0)
 
             page_index = idx_counter[0]
             idx_counter[0] += 1
@@ -342,52 +222,57 @@ def generate_tree_navigation(nav_structure, valid_indices, duplicate_map):
 
 
 async def process_page(i, title, url, has_href, page_pool, stats, progress, mode, lock, db_conn,
-                       seen_hashes, seen_css_hashes, global_styles, contents_dict, valid_indices, duplicate_map,
-                       table_report):
+                       seen_hashes, seen_css_hashes, global_styles, contents_dict, valid_indices, duplicate_map):
     if stats.interrupted: return
 
     # ==================================================================
     # 续传逻辑重构 (v11.8)
     # ==================================================================
 
-    # 修复点：修正纯目录外壳判定逻辑
-    # 修复点：修正纯目录外壳判定逻辑
-    is_directory_shell = not url or not url.strip() or "javascript:void(0)" in url
-    if is_directory_shell:
+    # 1. 首先处理纯目录外壳，这种节点没有内容，直接跳过并标记为完成
+    if not has_href and (not url.strip() or 'javascript' in url.lower() or url.startswith('#')):
         print(f"   ℹ️ [{i + 1}] {title} (📁 纯目录外壳，自动跳过)")
         async with lock:
-            if title not in progress['completed']:
-                progress['completed'].append(title)
+            if title not in progress['completed']: progress['completed'].append(title)
             stats.processed_pages += 1
             stats.success_count += 1
-            if stats.processed_pages % 10 == 0:
-                save_progress(progress)
+            if stats.processed_pages % 10 == 0: save_progress(progress)
         return
 
-    # 2. 【核心修复】彻底抛弃 progress.json，直接以 SQLite 数据库为唯一真理进行续传
-    cached_content = None
-    cached_css = None
-    try:
-        async with lock:
-            # 🚀 改为用 url 精准查询，防止同名不同页的误判
-            row = db_conn.execute("SELECT html, css_hash FROM cache WHERE url=?", (url,)).fetchone()
-            if row:
-                cached_content, css_hash = row
-                if css_hash:
-                    style_row = db_conn.execute("SELECT content FROM styles WHERE hash=?", (css_hash,)).fetchone()
-                    if style_row:
-                        cached_css = style_row[0]
-    except Exception:
-        pass
+    # 2. 检查是否已在 'completed' 列表且数据库中有缓存
+    is_completed = False
+    async with lock:
+        if title in progress['completed']:
+            is_completed = True
 
-    if cached_content:
-        # 修复点：检查缓存是否脏了 (包含侧边栏)
-        if 'doc-sidebar' in cached_content or 'id="doc-sidebar"' in cached_content:
-            print(f"   ⚠️ [{i + 1}] {title} (缓存包含侧边栏，视为脏数据，强制重抓)")
-            cached_content = None  # 标记为无效，触发重抓
-        else:
-            content_hash = hashlib.md5(cached_content.encode()).hexdigest()
+    if is_completed:
+        cached_content = None
+        cached_css = None
+        try:
             async with lock:
+                # 🚀 升级：从 cache 表读取 html 和 css_hash，然后从 styles 表读取 css
+                row = db_conn.execute("SELECT html, css_hash FROM cache WHERE title=?", (title,)).fetchone()
+                if row:
+                    cached_content, css_hash = row
+                    if css_hash:
+                        style_row = db_conn.execute("SELECT content FROM styles WHERE hash=?", (css_hash,)).fetchone()
+                        if style_row:
+                            cached_css = style_row[0]
+        except Exception:
+            pass
+
+        if cached_content:
+            # 修复点：检查缓存是否脏了 (包含侧边栏)
+            if 'doc-sidebar' in cached_content or 'id="doc-sidebar"' in cached_content:
+                print(f"   ⚠️ [{i + 1}] {title} (缓存包含侧边栏，视为脏数据，强制重抓)")
+                cached_content = None  # 标记为无效，触发重抓
+            # 修复点：检查内容是否过短 (防止空内容被误判为有效)
+            elif len(cached_content.strip()) < 50:
+                print(f"   ⚠️ [{i + 1}] {title} (缓存内容过短/为空，视为无效，强制重抓)")
+                cached_content = None
+            else:
+                content_hash = hashlib.md5(cached_content.encode()).hexdigest()
+                async with lock:
                     if content_hash not in seen_hashes:
                         seen_hashes[content_hash] = i
                         contents_dict[i] = f"<div class=\"page-section\" id=\"page_{i}\">{cached_content}</div>"
@@ -399,25 +284,29 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                                 global_styles.append(cached_css)
                                 seen_css_hashes.add(css_hash)
                             else:
-                                # 调试：CSS 去重命中（可能存在误杀/过度去重）
-                                # print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
-                                pass
+                                # 调试：CSS 去重命中
+                                print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
 
-                        stats.success_count += 1
-                        print(f"[{i + 1}] {title} (✓ 数据库极速恢复)")
                     else:
                         duplicate_map[i] = seen_hashes[content_hash]
                         stats.redundant_count += 1
                         print(f"[{i + 1}] {title} (🔗 缓存映射复用)")
-                    stats.processed_pages += 1
+                    
+                    stats.success_count += 1
+                    print(f"[{i + 1}] {title} (✓ 数据库极速恢复)")
+            stats.processed_pages += 1
+        
+        # 只有当 cached_content 确实有效时才返回，否则继续执行下载逻辑
+        if cached_content:
             return
 
-    # 如果代码执行到这里，意味着：
-    # - 这是一个新页面
-    # - 这是一个之前失败的页面 (不在 'completed' 列表里)
-    # - 这是一个在 'completed' 列表里但缓存丢失的页面
-    # - 这是一个缓存脏了的页面
-    # 无论哪种情况，都需要重新抓取。
+
+# 如果代码执行到这里，意味着：
+# - 这是一个新页面
+# - 这是一个之前失败的页面 (不在 'completed' 列表里)
+# - 这是一个在 'completed' 列表里但缓存丢失的页面
+# - 这是一个缓存脏了/空的页面
+# 无论哪种情况，都需要重新抓取。
     print(f"[{i + 1}] 🚀 开始提取: {title}")
 
     # 🚀 从池中获取一个空闲的页面实例 (代替昂贵的 new_page)
@@ -428,7 +317,6 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
         success = False
         extracted_data = ""
         extracted_css = ""
-        extracted_table_sigs = []
 
         while retry_count < 3 and not success:
             try:
@@ -449,7 +337,7 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                         else:
                             raise Exception("DIRECTORY_NODE_SKIPPED")
 
-                # 依赖evaluate内部的智能等待机制
+                await page.wait_for_timeout(1500)
 
                 cookie_buttons = [
                     'button:has-text("接受所有Cookie")', 'button:has-text("Accept all cookies")',
@@ -579,20 +467,6 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
 
                         const baseUrl = frameDoc.baseURI || document.baseURI;
 
-                        // 🚀 增强：CSS URL 绝对化处理函数
-                        function cssTextToAbsoluteUrls(cssText, baseUrl) {
-                            return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, url) => {
-                                const raw = url.trim();
-                                if (!raw || raw.startsWith("data:") || raw.startsWith("blob:") || raw.startsWith("#")) return match;
-                                if (/^https?:\/\//i.test(raw)) return `url(${quote}${raw}${quote})`;
-                                try {
-                                    return `url(${quote}${new URL(raw, baseUrl).href}${quote})`;
-                                } catch (e) {
-                                    return match;
-                                }
-                            });
-                        }
-
                         clone.querySelectorAll('*').forEach(el => {
 
                               // 保留 locator 表格的 colgroup/col width（维持列宽），但清理其它表格的 width 避免被撑满
@@ -609,33 +483,12 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                             }
                         });
 
-                        // table signature inventory (for reporting)
-                        const tableSigs = Array.from(clone.querySelectorAll('table')).map(t => {
-                            const rows = t.querySelectorAll('tr').length;
-                            const firstRow = t.querySelector('tr');
-                            const cols = firstRow ? firstRow.children.length : 0;
-                            return {
-                                classes: Array.from(t.classList || []),
-                                isLocator: t.classList && t.classList.contains('locator'),
-                                hasColgroup: !!t.querySelector('colgroup'),
-                                hasThead: !!t.querySelector('thead'),
-                                hasTbody: !!t.querySelector('tbody'),
-                                rows,
-                                cols
-                            };
-                        });
-
-                        // 🚀 应用 CSS URL 绝对化
-                        const processedCss = cssTextToAbsoluteUrls(cssText, baseUrl);
-
-                        return { html: clone.innerHTML.trim(), css: processedCss, tableSigs };
+                        return { html: clone.innerHTML.trim(), css: cssText };
                     }
-
                 """)
 
                 extracted_data = result['html']
                 extracted_css = result.get('css', '')
-                extracted_table_sigs = result.get('tableSigs', [])
                 success = True
 
             except Exception as page_error:
@@ -671,39 +524,32 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                     contents_dict[i] = f"<div class=\"page-section\" id=\"page_{i}\">{extracted_data}</div>"
                     valid_indices.add(i)
 
-                    # table inventory report (per page)
-                    try:
-                        update_table_report(table_report, title, url, extracted_table_sigs)
-                    except Exception as e:
-                        print(f"⚠️ 表格统计失败: {e}")
-
                     if extracted_css:
                         css_hash = hashlib.md5(extracted_css.encode('utf-8')).hexdigest()
                         if css_hash not in seen_css_hashes:
                             global_styles.append(extracted_css)
                             seen_css_hashes.add(css_hash)
                         else:
-                            # 调试：CSS 去重命中（可能存在误杀/过度去重）
-                            # print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
-                            pass
+                            # 调试：CSS 去重命中
+                            print(f"   🧪 [CSS去重命中] {title} -> {css_hash[:10]} (已存在)")
 
-                        try:
-                            db_conn.execute("INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)",
-                                            (css_hash, extracted_css))
-                        except:
-                            pass
+                    try:
+                        db_conn.execute("INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)",
+                                        (css_hash, extracted_css))
+                    except:
+                        pass
 
-                    stats.success_count += 1
-                    print(f"[{i + 1}] {title} (✓ 抓取成功) | {stats.get_progress_info()}")
+                stats.success_count += 1
+                print(f"[{i + 1}] {title} (✓ 抓取成功) | {stats.get_progress_info()}")
 
+                # 修复点：只有成功时才更新 completed 列表和写入数据库
                 if title in progress['failed']: progress['failed'].remove(title)
                 if title not in progress['completed']: progress['completed'].append(title)
 
                 try:
                     css_hash_val = hashlib.md5(extracted_css.encode('utf-8')).hexdigest() if extracted_css else ""
-                    # 写入时增加 url 字段
-                    db_conn.execute("REPLACE INTO cache (url, title, html, css_hash) VALUES (?, ?, ?, ?)",
-                                    (url, title, extracted_data, css_hash_val))
+                    db_conn.execute("REPLACE INTO cache (title, html, css_hash) VALUES (?, ?, ?)",
+                                    (title, extracted_data, css_hash_val))
                     db_conn.commit()
                 except Exception as e:
                     print(f"写入数据库失败: {e}")
@@ -726,17 +572,10 @@ async def main():
     seen_css_hashes = set()
     contents_dict = {}
 
-    table_report = {
-        "total_pages_with_tables": 0,
-        "total_tables": 0,
-        "by_signature": {},
-        "by_class": {}
-    }
-
     lock = asyncio.Lock()
 
     print("=" * 50)
-    print("🚀 NX文档聚合器 - 终极全自动版 (v11.28 修复版：兼容 JS 版生成的 JSON 结构)")
+    print("🚀 NX文档聚合器 - 终极全自动版 (v11.22 修复版：修复失败页面误判为完成的Bug)")
     print("=" * 50)
     print("[a] 全自动一键探测 (探测结构 + 并发抓取)")
     print("[c] 增量续传模式 (基于现有 SQLite 恢复)")
@@ -775,8 +614,7 @@ async def main():
             db_conn.execute("DROP TABLE IF EXISTS cache")
             mode = 'r'  # 强制转为重抓模式
 
-    # 修复：使用 url 作为主键，彻底解决同名目录相互覆盖的 Bug
-    db_conn.execute("CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, title TEXT, html TEXT, css_hash TEXT)")
+    db_conn.execute("CREATE TABLE IF NOT EXISTS cache (title TEXT PRIMARY KEY, html TEXT, css_hash TEXT)")
 
     # 🚀 数据库诊断与优化
     print("🧹 正在执行数据库 VACUUM 压缩...")
@@ -826,13 +664,11 @@ async def main():
 
         def flatten(nodes):
             for n in nodes:
-                # 修复点：优先读取 'url' 字段（JS 版生成），如果不存在则读取 'href'（Python 版生成）
-                url = n.get('url') if 'url' in n else n.get('href', '')
-                
                 pages.append({
                     'text': n['text'],
-                    'href': url,
-                    'has_href': bool(url and url.strip() and 'javascript:void(0)' not in url)
+                    'href': n.get('href', ''),
+                    'has_href': bool(
+                        n.get('href') and n['href'].strip() and 'javascript:void(0)' not in n.get('href', ''))
                 })
                 if n.get('children'): flatten(n['children'])
 
@@ -869,10 +705,8 @@ async def main():
         for i, page_info in enumerate(pages):
             task = asyncio.create_task(
                 process_page(i, page_info['text'], page_info['href'], page_info['has_href'],
-
                              page_pool, stats, progress, mode, lock, db_conn,
-                             seen_hashes, seen_css_hashes, global_styles, contents_dict, valid_indices, duplicate_map,
-                             table_report)
+                             seen_hashes, seen_css_hashes, global_styles, contents_dict, valid_indices, duplicate_map)
             )
             tasks.append(task)
 
@@ -883,9 +717,6 @@ async def main():
         await browser.close()
         save_progress(progress)
         db_conn.close()
-        # 写出表格类型统计报告
-        write_table_reports(table_report)
-        print(f"📄 表格统计已输出: {TABLE_REPORT_TXT} / {TABLE_REPORT_JSON}")
 
         # 🛡️ OOM 内存防爆：流式写入合成最终 HTML
         # 修复：移除 if contents_dict: 判断，强制执行写入逻辑
@@ -915,6 +746,7 @@ async def main():
 
         /* 优化点：统一正文主标题颜色 */
         .content-wrapper h1 {{ font-size: 32px !important; color: #007cba !important; font-weight: bold; margin-bottom: 15px; }}
+        .content-wrapper h2 {{ color: #007cba !important; }}
 
         /* 修复点：彻底移除所有针对表格的强制样式，完全依赖页面自带 CSS */
 
@@ -925,9 +757,9 @@ async def main():
 
         ul.nested {{ 
             display: none; 
-            padding-left: 0px !important;
-            border-left: 1px solid #888 !important;
-            margin-left: 6px !important; 
+            padding-left: 4px; 
+            border-left: 1px solid #888; 
+            margin-left: 7px; 
             margin-top: 2px;
             margin-bottom: 2px; 
         }}
@@ -970,52 +802,9 @@ async def main():
 
         .page-section {{ margin-bottom: 80px; padding-top: 30px; border-top: 2px solid #eaeaea; }}
         .page-section:first-child {{ border-top: none; padding-top: 0; }}
-
-        /* --- REV 2026-02-19 #06: table readability (offline) --- */
-        /*
-          来自 table_report：页面里主要表格类型为：
-          - (no-class) 占多数：离线页容易被挤压导致换行/变形
-          - locator：用于“位于何处”等小表
-          - navigator：少量表格
-        */
-
-        /* 1) no-class：尽量保持单元格不乱换行；同时允许横向滚动兜底。 */
-        .main-content table:not([class]) td,
-        .main-content table:not([class]) th {{
-            white-space: nowrap;
-        }}
-        .main-content .content-wrapper:has(table:not([class])) {{
-            overflow-x: auto;
-        }}
-
-        /* 2) navigator：同样避免换行导致的“表格竖排”。 */
-        .main-content table.navigator td,
-        .main-content table.navigator th {{
-            white-space: nowrap;
-        }}
-        .main-content .content-wrapper:has(table.navigator) {{
-            overflow-x: auto;
-        }}
-
-        /* 3) locator：常见于“位于何处?”这类两列小表。 */
-        .main-content table.locator {{
-            table-layout: auto;
-            width: max-content;           /* allow table to be as wide as needed */
-            max-width: 100%;
-        }}
-        .main-content table.locator td,
-        .main-content table.locator th {{
-            white-space: nowrap;          /* prevent tight tables from wrapping into multiple lines */
-        }}
-        /* 仅当页面存在 locator 表格时，横向滚动兜底（让表格自己滚，不挤压内容）。 */
-        .main-content .content-wrapper:has(table.locator) {{
-            overflow-x: auto;
-         }}
     </style>
-
 </head>
 <body>
-
     <div class="nx-sidebar">
         <div class="nx-sidebar-header">
             <h3 style="color: #007cba; margin: 0; text-align: center; font-size: 24px;">{SIDEBAR_TITLE}</h3>
