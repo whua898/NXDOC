@@ -41,6 +41,14 @@ NX文档聚合器 - 终极完全体 (v11.28 修复版：兼容 JS 版生成的 J
 # [REV 2026-02-19 #08] 增强：添加 cssTextToAbsoluteUrls 函数，修复 CSS 中的相对路径。
 # [REV 2026-02-19 #09] 修复：load_progress 和 save_progress 强制使用 utf-8 编码。
 # [REV 2026-02-19 #10] 修复：flatten 函数优先读取 'url' 字段，兼容 JS 版生成的 JSON。
+# [REV 2026-04-24 #11] 🚀 重大升级：完整复刻 JS 版功能 - 视频提取引擎 + 表格分类打标 + 小图标保护
+#   - 新增：5层视频链接提取策略（属性/source/父节点/script/网络拦截）
+#   - 新增：MutationObserver 等待动态渲染
+#   - 新增：6种表格精准分类（toxic-wide/nested-parent/nested-child/multi-image/code-comparison/media-code）
+#   - 新增：小图标保护机制（≤80px 添加 inline-small-icon 类）
+#   - 新增：代码块清理（移除 Copy 按钮和工具栏）
+#   - 增强：CSS URL 绝对化处理（与 JS 版完全一致）
+#   - 增强：播放器修复（剥离 Plyr，启用原生 controls）
 
 import asyncio
 from playwright.async_api import async_playwright
@@ -52,19 +60,64 @@ import sys
 import random
 import hashlib
 import sqlite3
+import re
+
+# ==========================================
+# 📋 批量任务配置区 (从 download_list.txt 读取)
+# ==========================================
+
+def load_subjects_from_file(filename="download_list.txt"):
+    """
+    从 download_list.txt 读取主题配置
+    格式：每两行为一组（标题 + URL）
+    返回：[{name, url, title}, ...]
+    """
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        lines = [line.strip() for line in content.split('\n') if line.strip()]
+        
+        subjects = []
+        # 每两行为一组：标题 + URL
+        for i in range(0, len(lines), 2):
+            if i + 1 < len(lines):
+                title = lines[i]
+                url = lines[i + 1]
+                
+                # 生成安全的名称（与 JS 版一致）
+                name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', title)
+                
+                if url.startswith('http') and len(title) > 0:
+                    subjects.append({
+                        'name': name,
+                        'url': url,
+                        'title': title
+                    })
+        
+        return subjects
+    except FileNotFoundError:
+        print(f"❌ 配置文件 {filename} 不存在，请创建 download_list.txt 文件")
+        return []
+    except Exception as e:
+        print(f"❌ 读取配置文件出错: {e}")
+        return []
+
+SUBJECTS = load_subjects_from_file()
 
 # ==========================================
 # ⚙️ 全局配置区 (Global Configuration)
 # ==========================================
-START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/feat_based_mach_fbm_overview";
-# START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/feat_based_mach_fbm_overview"
+# 动态变量（将在 start_job 中设置）
+START_URL = ""
+FINAL_OUTPUT_FILE = ""
+CACHE_DB_FILE = ""
+SIDEBAR_TITLE = ""
+NAV_JSON_FILE = ""
+OUTPUT_DIR = "output"  # 专门的输出目录
 
-FINAL_OUTPUT_FILE = "NX12基于特征加工-py.html"  # 最终生成的单文件 HTML 名称
-CACHE_DB_FILE = "NX12_pages.db"  # 🚀 升级为 SQLite 数据库文件
-
-SIDEBAR_TITLE = "NX12&nbsp;&nbsp;基于特征加工"  # 侧边栏大标题 (&nbsp;代表空格)
+# 固定常量
 MAX_CONCURRENCY = 9  # 🚀 并发线程数量 (推荐: 极速设5，防封锁设2)
-NAV_JSON_FILE = "NX12_nav_structure.json"  # 目录结构 JSON 文件名
 TABLE_REPORT_JSON = "table_report.json"
 TABLE_REPORT_TXT = "table_report.txt"
 
@@ -463,179 +516,553 @@ async def process_page(i, title, url, has_href, page_pool, stats, progress, mode
                         pass
 
                 result = await page.evaluate(r"""
-                    async () => {
-                        const getDoc = () => {
-                            let doc = document;
-                            const iframes = Array.from(document.querySelectorAll('iframe'));
-                            for (const frame of iframes) {
-                                if (frame.src && (frame.src.includes('/documentation/') || frame.src.includes('help'))) {
-                                    try { if (frame.contentDocument) doc = frame.contentDocument; } catch(e) {}
-                                    break;
-                                }
-                            }
-                            if (document.querySelector('#xhtml')) {
-                                try { doc = document.querySelector('#xhtml').contentDocument || document; } catch(e) {}
-                            }
-                            return doc;
-                        };
 
-                        let frameDoc = getDoc();
-                        let container = null;
-                        let retries = 30; 
+// ============================================================================
+// ultra_simple8.py 增强版 evaluate 脚本
+// 完整复刻 nxdoc_scraper_no_img完美版.js 的核心功能
+// 使用方法：替换 ultra_simple8.py 第473-642行的 evaluate 内容
+// ============================================================================
 
-                        while(retries > 0) {
-                            frameDoc = getDoc();
-                            // 修复点：回归 ultra_simple4.py 的查找逻辑
-                            container = frameDoc.querySelector('div.doc-content') || 
-                                        frameDoc.querySelector('.main.content-container') || 
-                                        frameDoc.querySelector('#content');
+async () => {
+    // ==========================================
+    // 1. 获取文档对象（iframe 兼容）
+    // ==========================================
+    const getDoc = () => {
+        let doc = document;
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const frame of iframes) {
+            if (frame.src && (frame.src.includes('/documentation/') || frame.src.includes('help'))) {
+                try { if (frame.contentDocument) doc = frame.contentDocument; } catch(e) {}
+                break;
+            }
+        }
+        if (document.querySelector('#xhtml')) {
+            try { doc = document.querySelector('#xhtml').contentDocument || document; } catch(e) {}
+        }
+        return doc;
+    };
 
-                            if (container) {
-                                let visibleText = container.innerText || "";
-                                let textLen = visibleText.replace(/\s+/g, '').length;
-                                if (textLen >= 15 && !visibleText.includes('Loading...')) { break; }
-                            }
-                            await new Promise(r => setTimeout(r, 250));
-                            retries--;
-                        }
+    let frameDoc = getDoc();
+    let container = null;
+    let retries = 30;
 
-                        // 修复点：回归 ultra_simple4.py 的回退逻辑
-                        if (!container) container = frameDoc.body;
-                        if (!container) throw new Error("DOM_CONTAINER_NOT_FOUND");
+    while(retries > 0) {
+        frameDoc = getDoc();
+        container = frameDoc.querySelector('div.doc-content') || 
+                    frameDoc.querySelector('.main.content-container') || 
+                    frameDoc.querySelector('#content');
 
-                        let finalLen = container.innerText.replace(/\s+/g, '').length;
-                        if (finalLen < 15) throw new Error("REAL_TEXT_TOO_SHORT");
+        if (container) {
+            let visibleText = container.innerText || "";
+            let textLen = visibleText.replace(/\s+/g, '').length;
+            if (textLen >= 15 && !visibleText.includes('Loading...')) { break; }
+        }
+        await new Promise(r => setTimeout(r, 250));
+        retries--;
+    }
 
-                        const scrollTargets = [frameDoc.defaultView, window, container, frameDoc.scrollingElement || frameDoc.body].filter(el => el != null);
-                        let maxScroll = 5000;
-                        scrollTargets.forEach(t => { if (t.scrollHeight && t.scrollHeight > maxScroll) maxScroll = t.scrollHeight; });
-                        for(let pos = 0; pos <= maxScroll; pos += 1000) {
-                            scrollTargets.forEach(target => {
-                                try { if (target.scrollTo) target.scrollTo(0, pos); else target.scrollTop = pos; } catch(e) {}
-                            });
-                            await new Promise(r => setTimeout(r, 50));
-                        }
+    if (!container) container = frameDoc.body;
+    if (!container) throw new Error("DOM_CONTAINER_NOT_FOUND");
 
-                        let cssText = '';
-                        const styleTags = Array.from(frameDoc.querySelectorAll('style'));
-                        for (const style of styleTags) cssText += style.textContent + '\n';
+    let finalLen = container.innerText.replace(/\s+/g, '').length;
+    if (finalLen < 15) throw new Error("REAL_TEXT_TOO_SHORT");
 
-                        const links = Array.from(frameDoc.querySelectorAll('link[rel="stylesheet"]'));
-                        for (const link of links) {
-                            try {
-                                if (link.href && !link.href.includes('google') && !link.href.includes('typekit')) {
-                                    const response = await fetch(link.href);
-                                    if (response.ok) cssText += await response.text() + '\n';
-                                }
-                            } catch (e) {}
-                        }
+    // ==========================================
+    // 2. 🚀 滚动触发懒加载（视频/图片）
+    // ==========================================
+    const scrollTargets = [frameDoc.defaultView, window, container, frameDoc.scrollingElement || frameDoc.body].filter(el => el != null);
+    let maxScroll = 5000;
+    scrollTargets.forEach(t => { if (t.scrollHeight && t.scrollHeight > maxScroll) maxScroll = t.scrollHeight; });
+    for(let pos = 0; pos <= maxScroll; pos += 1000) {
+        scrollTargets.forEach(target => {
+            try { if (target.scrollTo) target.scrollTo(0, pos); else target.scrollTop = pos; } catch(e) {}
+        });
+        await new Promise(r => setTimeout(r, 50));
+    }
 
-                        // 只抓正文内容：优先抓 frameDoc 内的 .doc-content（避免把站点顶栏/侧栏一起抓进来）
-                        const clone = (frameDoc.querySelector("div.doc-content") || container).cloneNode(true);
-
-                        // 修复点：保留强力清洗逻辑，以防万一回退到 body 时抓到了侧边栏
-                        const unwantedSelectors = [
-                            // 站点/页面级顶栏、导航等（离线文档不需要）
-                            'header', '.navbar', '.site-header', '.topbar', '.app-header',
-                            '.breadcrumb', '.breadcrumbs', '.global-nav', '.nav-header',
-                            '.doc-sidebar', '#doc-sidebar', 
-
-                            '#topic-navigator', 
-                            '.hidden-md-up', 
-                            '#feedback-btns', 
-                            '.gutter',
-                            '.doc-main-contents > div.hidden-md-up'
-                        ];
-
-                        unwantedSelectors.forEach(sel => {
-                            const els = clone.querySelectorAll(sel);
-                            els.forEach(el => el.remove());
-                        });
-
-                        const footerKeywords = [
-                            'Learn more', 'How do I', 'Look up more details', 'See also', 'See Also',
-                            'Related Concepts', 'Related Reference', 'Related Topics', 'Related Tasks', 'Related Information', 'Related Links',
-                            '相关概念', '相关参考', '相关主题', '相关任务', '相关信息', '相关链接',
-                            '了解更多', '如何操作', '如何...', '查找更多详细信息', '另请参见'
-                        ];
-
-                        Array.from(clone.querySelectorAll('*')).forEach(el => {
-                            const txt = (el.textContent || '').trim();
-                            if (footerKeywords.includes(txt) && /^(H[1-6]|STRONG|B|DIV|SPAN)$/i.test(el.tagName)) {
-                                const wrapper = el.closest('.container-fluid, .related-links, .topic-links, .familylinks');
-                                if (wrapper && wrapper !== clone && (wrapper.textContent || '').length < 2000) {
-                                    wrapper.remove();
-                                } else {
-                                    let next = el.nextElementSibling;
-                                    while (next) {
-                                        let tmp = next;
-                                        next = next.nextElementSibling;
-                                        tmp.remove();
-                                    }
-                                    el.remove();
-                                }
-                            }
-                        });
-
-                        const baseUrl = frameDoc.baseURI || document.baseURI;
-
-                        // 🚀 增强：CSS URL 绝对化处理函数
-                        function cssTextToAbsoluteUrls(cssText, baseUrl) {
-                            return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, url) => {
-                                const raw = url.trim();
-                                if (!raw || raw.startsWith("data:") || raw.startsWith("blob:") || raw.startsWith("#")) return match;
-                                if (/^https?:\/\//i.test(raw)) return `url(${quote}${raw}${quote})`;
-                                try {
-                                    return `url(${quote}${new URL(raw, baseUrl).href}${quote})`;
-                                } catch (e) {
-                                    return match;
-                                }
-                            });
-                        }
-
-                        clone.querySelectorAll('*').forEach(el => {
-
-                              // 保留 locator 表格的 colgroup/col width（维持列宽），但清理其它表格的 width 避免被撑满
-                            const tag = el.tagName.toLowerCase();
-                            if (tag === 'table' && !el.classList.contains('locator')) el.removeAttribute('width');
-                            if ((tag === 'colgroup' || tag === 'col') && !(el.closest && el.closest('table.locator'))) el.removeAttribute('width');
-                            if (el.hasAttribute('src')) try { el.src = new URL(el.getAttribute('src'), baseUrl).href; } catch(e) {}
-
-                            if (el.hasAttribute('href')) try { el.href = new URL(el.getAttribute('href'), baseUrl).href; } catch(e) {}
-                            if (el.hasAttribute('style')) {
-                                let cleanStyle = el.getAttribute('style').replace(/url\(['"]?data:image\/[^)]+['"]?\)/gi, 'none');
-                                if (cleanStyle.trim() === '' || cleanStyle === 'none') el.removeAttribute('style');
-                                else el.setAttribute('style', cleanStyle);
-                            }
-                        });
-
-                        // table signature inventory (for reporting)
-                        const tableSigs = Array.from(clone.querySelectorAll('table')).map(t => {
-                            const rows = t.querySelectorAll('tr').length;
-                            const firstRow = t.querySelector('tr');
-                            const cols = firstRow ? firstRow.children.length : 0;
-                            return {
-                                classes: Array.from(t.classList || []),
-                                isLocator: t.classList && t.classList.contains('locator'),
-                                hasColgroup: !!t.querySelector('colgroup'),
-                                hasThead: !!t.querySelector('thead'),
-                                hasTbody: !!t.querySelector('tbody'),
-                                rows,
-                                cols
-                            };
-                        });
-
-                        // 🚀 应用 CSS URL 绝对化
-                        const processedCss = cssTextToAbsoluteUrls(cssText, baseUrl);
-
-                        return { html: clone.innerHTML.trim(), css: processedCss, tableSigs };
+    // ==========================================
+    // 3. 🚀 等待视频组件加载（MutationObserver）
+    // ==========================================
+    window.__interceptedMediaUrls = interceptedMediaUrls;
+    const videos = frameDoc.querySelectorAll("disw-video");
+    if (videos.length > 0) {
+        await Promise.all(
+            Array.from(videos).map((v) => {
+                return new Promise((resolve) => {
+                    if (v.querySelector("video source") || v.querySelector("video[src]")) {
+                        return resolve();
                     }
+                    const observer = new MutationObserver(() => {
+                        if (v.querySelector("video source") || v.querySelector("video[src]")) {
+                            observer.disconnect();
+                            resolve();
+                        }
+                    });
+                    observer.observe(v, { childList: true, subtree: true });
+                    setTimeout(() => {
+                        observer.disconnect();
+                        resolve();
+                    }, 8000);
+                });
+            })
+        );
+    }
 
+    // ==========================================
+    // 4. 🚀 5层视频链接提取策略
+    // ==========================================
+    frameDoc.querySelectorAll("video").forEach((v) => {
+        let realSrc = null;
+
+        // 层1：检查 video 自身的属性
+        Array.from(v.attributes).forEach((attr) => {
+            if (attr.value.includes(".mp4") || attr.value.includes(".webm") || attr.value.includes(".m3u8")) {
+                realSrc = attr.value;
+            }
+        });
+
+        // 层2：检查 source 子节点
+        if (!realSrc) {
+            v.querySelectorAll("source").forEach((s) => {
+                let src = s.getAttribute("src") || s.getAttribute("data-src") || s.getAttribute("data-video-src");
+                if (src && (src.includes(".mp4") || src.includes(".webm") || src.includes(".m3u8"))) {
+                    realSrc = src;
+                }
+            });
+        }
+
+        // 层3：向上遍历父节点查找
+        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+            let parent = v.parentElement;
+            while (parent && parent.tagName !== "BODY") {
+                Array.from(parent.attributes).forEach((attr) => {
+                    if (attr.value.includes(".mp4") || attr.value.includes(".webm") || attr.value.includes(".m3u8")) {
+                        realSrc = attr.value;
+                    }
+                });
+                if (realSrc) break;
+
+                if (parent.tagName.toLowerCase() === "disw-video") {
+                    const videoUrl = parent.getAttribute("video-url") || parent.getAttribute("src") || 
+                                   parent.getAttribute("data-video-url") || parent.getAttribute("data-src");
+                    if (videoUrl) {
+                        realSrc = videoUrl;
+                        break;
+                    }
+                    let match = parent.innerHTML.match(/(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i);
+                    if (match) {
+                        realSrc = match[1];
+                        break;
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        // 层4：全局搜索 script 标签中的视频链接
+        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+            let scripts = frameDoc.querySelectorAll("script");
+            for (let script of scripts) {
+                let match = script.textContent.match(/(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i);
+                if (match) {
+                    realSrc = match[1];
+                    break;
+                }
+            }
+        }
+
+        // 层5：从 window.__interceptedMediaUrls 中获取
+        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+            if (window.__interceptedMediaUrls && window.__interceptedMediaUrls.length > 0) {
+                realSrc = window.__interceptedMediaUrls[0];
+            }
+        }
+
+        if (realSrc) {
+            v.setAttribute("data-real-src", realSrc);
+        }
+    });
+
+    // 额外检查 disw-video
+    frameDoc.querySelectorAll("disw-video").forEach((v) => {
+        let realSrc = v.getAttribute("video-url") || v.getAttribute("src") || 
+                     v.getAttribute("data-video-url") || v.getAttribute("data-src");
+        if (!realSrc) {
+            Array.from(v.attributes).forEach((attr) => {
+                if (attr.value.includes(".mp4") || attr.value.includes(".webm") || attr.value.includes(".m3u8")) {
+                    realSrc = attr.value;
+                }
+            });
+        }
+        if (!realSrc) {
+            let match = v.innerHTML.match(/(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i);
+            if (match) realSrc = match[1];
+        }
+        if (!realSrc && window.__interceptedMediaUrls && window.__interceptedMediaUrls.length > 0) {
+            realSrc = window.__interceptedMediaUrls[0];
+        }
+        if (realSrc) {
+            let video = v.querySelector("video");
+            if (!video) {
+                video = frameDoc.createElement("video");
+                video.setAttribute("data-real-src", realSrc);
+                v.appendChild(video);
+            } else if (!video.getAttribute("data-real-src")) {
+                video.setAttribute("data-real-src", realSrc);
+            }
+        }
+    });
+
+    // ==========================================
+    // 5. 克隆 DOM 并清理
+    // ==========================================
+    const clone = (frameDoc.querySelector("div.doc-content") || container).cloneNode(true);
+
+    // 移除不需要的元素
+    const unwantedSelectors = [
+        'header', '.navbar', '.site-header', '.topbar', '.app-header',
+        '.breadcrumb', '.breadcrumbs', '.global-nav', '.nav-header',
+        '.doc-sidebar', '#doc-sidebar', '#topic-navigator', 
+        '.hidden-md-up', '#feedback-btns', '.gutter',
+        '.cookie-banner', '.cookie-consent', '.gdpr-banner',
+        '.disw-video-loader-container'
+    ];
+    unwantedSelectors.forEach(sel => {
+        const els = clone.querySelectorAll(sel);
+        els.forEach(el => el.remove());
+    });
+
+    // 页脚关键词清理
+    const footerKeywords = [
+        'Learn more', 'How do I', 'Look up more details', 'See also', 'See Also',
+        'Related Concepts', 'Related Reference', 'Related Topics', 'Related Tasks', 
+        'Related Information', 'Related Links',
+        '相关概念', '相关参考', '相关主题', '相关任务', '相关信息', '相关链接',
+        '了解更多', '如何操作', '如何...', '查找更多详细信息', '另请参见'
+    ];
+
+    Array.from(clone.querySelectorAll('*')).forEach(el => {
+        const txt = (el.textContent || '').trim();
+        if (footerKeywords.includes(txt) && /^(H[1-6]|STRONG|B|DIV|SPAN)$/i.test(el.tagName)) {
+            const wrapper = el.closest('.container-fluid, .related-links, .topic-links, .familylinks');
+            if (wrapper && wrapper !== clone && (wrapper.textContent || '').length < 2000) {
+                wrapper.remove();
+            } else {
+                let next = el.nextElementSibling;
+                while (next) {
+                    let tmp = next;
+                    next = next.nextElementSibling;
+                    tmp.remove();
+                }
+                el.remove();
+            }
+        }
+    });
+
+    const baseUrl = frameDoc.baseURI || document.baseURI;
+
+    // ==========================================
+    // 6. 🌟 小图标保护（≤80px）
+    // ==========================================
+    clone.querySelectorAll("img").forEach((img) => {
+        if ((img.clientWidth > 0 && img.clientWidth <= 80) || 
+            (img.naturalWidth > 0 && img.naturalWidth <= 80)) {
+            img.classList.add("inline-small-icon");
+        }
+    });
+
+    // ==========================================
+    // 7. 处理图片和视频链接（绝对化 + 恢复真实链接）
+    // ==========================================
+    clone.querySelectorAll("img").forEach((img) => {
+        if (img.hasAttribute("src")) {
+            const absoluteUrl = new URL(img.getAttribute("src"), baseUrl).href;
+            img.src = absoluteUrl;
+            img.removeAttribute("loading");
+            img.setAttribute("decoding", "async");
+        }
+    });
+
+    clone.querySelectorAll("a, video, source, track").forEach((el) => {
+        // 尝试从 data-real-src 恢复真实的 src
+        ["data-real-src", "data-src", "data-video-src"].forEach((attr) => {
+            if (el.hasAttribute(attr)) {
+                const val = el.getAttribute(attr);
+                if (val && !val.startsWith("blob:") && !val.startsWith("data:")) {
+                    el.setAttribute("src", val);
+                }
+            }
+        });
+
+        if (el.tagName === "A" && el.hasAttribute("href")) {
+            try { el.href = new URL(el.getAttribute("href"), baseUrl).href; } catch (e) {}
+        } else if ((el.tagName === "VIDEO" || el.tagName === "SOURCE" || el.tagName === "TRACK") && el.hasAttribute("src")) {
+            const src = el.getAttribute("src");
+            if (src && !src.startsWith("blob:") && !src.startsWith("data:")) {
+                try { el.src = new URL(src, baseUrl).href; } catch (e) {}
+            }
+        }
+
+        // 🚀 视频播放器修复
+        if (el.tagName === "VIDEO") {
+            ["poster", "data-poster"].forEach((attr) => {
+                if (el.hasAttribute(attr)) {
+                    const val = el.getAttribute(attr);
+                    if (val && !val.startsWith("blob:") && !val.startsWith("data:")) {
+                        try {
+                            const absUrl = new URL(val, baseUrl).href;
+                            el.setAttribute(attr, absUrl);
+                            if (attr === "data-poster") el.setAttribute("poster", absUrl);
+                        } catch (e) {}
+                    }
+                }
+            });
+
+            // 开启原生控制条，剥离 Plyr
+            el.setAttribute("controls", "true");
+            el.setAttribute("preload", "metadata");
+            el.style.cssText = "width:100%;height:auto;aspect-ratio:16/9;display:block;background:#000;";
+
+            const aspectRatioCtrl = el.closest(".aspectRatioHeightControl");
+            const diswVideo = el.closest("disw-video");
+            const targetToReplace = aspectRatioCtrl || diswVideo;
+
+            if (targetToReplace && targetToReplace.parentNode) {
+                targetToReplace.parentNode.replaceChild(el, targetToReplace);
+            } else {
+                el.classList.remove("plyr");
+                const plyr = el.closest(".plyr");
+                if (plyr) {
+                    plyr.classList.remove("plyr");
+                    plyr.querySelectorAll(".plyr__controls, .plyr__control--overlaid, .plyr__captions, .plyr__poster")
+                        .forEach((c) => c.remove());
+                }
+            }
+
+            // 强制显示被隐藏的播放器容器
+            let current = el;
+            while (current && current.tagName !== "BODY") {
+                if (current.style && current.style.display === "none") {
+                    current.style.display = "block";
+                }
+                current = current.parentNode;
+            }
+        }
+    });
+
+    // ==========================================
+    // 8. 清理代码块 Copy 按钮
+    // ==========================================
+    clone.querySelectorAll(".codeblock-toolbar").forEach((toolbar) => toolbar.remove());
+    clone.querySelectorAll("button, a, div, span").forEach((el) => {
+        const txt = (el.textContent || "").trim().toLowerCase();
+        if (txt === "copy" && (el.tagName === "BUTTON" || 
+            (el.className && typeof el.className === "string" && el.className.toLowerCase().includes("copy")))) {
+            el.remove();
+        }
+    });
+
+    // ==========================================
+    // 9. 📊 表格分类打标系统（6种类型）
+    // ==========================================
+    
+    // 9.1 全局清理：剥离硬编码宽度
+    clone.querySelectorAll("table").forEach((tbl) => {
+        if (tbl.getAttribute("border") === "0" || tbl.classList.contains("borderless")) {
+            tbl.classList.add("siemens-table-no-grid");
+        } else if (tbl.getAttribute("border") === "1" || tbl.classList.contains("siemens-table-grid")) {
+            tbl.classList.add("siemens-table-with-grid");
+        }
+
+        const tblW = tbl.getAttribute("width");
+        if (!tblW || (!tblW.includes("%") && !tblW.includes("*"))) tbl.removeAttribute("width");
+        tbl.removeAttribute("style");
+        
+        tbl.querySelectorAll("col, colgroup, td, th").forEach((el) => {
+            const w = el.getAttribute("width");
+            if (!w || (!w.includes("%") && !w.includes("*"))) el.removeAttribute("width");
+            el.removeAttribute("style");
+        });
+    });
+
+    // 9.2 嵌套表格处理
+    clone.querySelectorAll("table td table").forEach((tbl) => {
+        tbl.classList.add("nested-child-table");
+
+        if (tbl.classList.contains("tree") || tbl.classList.contains("navigator") || 
+            tbl.closest(".tree") || tbl.closest(".navigator")) {
+            tbl.classList.add("nested-text-table");
+            tbl.classList.add("siemens-table-no-grid");
+        } else if (tbl.querySelector("img:not(.inline-small-icon)")) {
+            tbl.classList.add("multi-image-layout-table");
+            if (!tbl.classList.contains("siemens-table-with-grid")) {
+                tbl.classList.add("siemens-table-no-grid");
+            }
+        } else {
+            tbl.classList.add("nested-text-table");
+        }
+    });
+
+    // 9.3 外层表格分类
+    clone.querySelectorAll("table:not(.locator):not(.navigator):not(.siemens-table-no-grid):not(.nested-child-table)")
+        .forEach((table) => {
+            if (table.classList.contains("siemens-options-table")) {
+                table.classList.add("nested-parent-table");
+                return;
+            }
+
+            let hasNested = table.querySelector("table") !== null;
+            let hasImg = table.querySelector("img, object, svg, picture") !== null;
+            let hasPre = table.querySelector("pre") !== null;
+            let hasPreInFirstCol = false;
+            let isToxic = false;
+            let isFirstColHuge = false;
+
+            const rows = Array.from(table.rows || []);
+            rows.forEach((row) => {
+                if (row.cells.length > 0) {
+                    if ((row.cells[0].textContent || "").trim().length > 150) isFirstColHuge = true;
+                    if (row.cells[0].querySelector("pre")) hasPreInFirstCol = true;
+                }
+                Array.from(row.cells).forEach((cell) => {
+                    const text = (cell.innerHTML || "").replace(/<[^>]+>/g, " ");
+                    const words = text.trim().split(/[^a-zA-Z0-9\u4e00-\u9fa5_-]+/);
+                    for (let w of words) if (w.length > 45) isToxic = true;
+                });
+            });
+
+            // 套上滚动保护壳
+            if (table.parentElement && !table.parentElement.classList.contains("table-scroll-wrapper")) {
+                const wrapper = frameDoc.createElement("div");
+                wrapper.className = hasImg ? "table-scroll-wrapper has-horizontal-scroll" : "table-scroll-wrapper";
+                table.parentNode.insertBefore(wrapper, table);
+                wrapper.appendChild(table);
+            }
+
+            if (hasNested) {
+                table.classList.add("nested-parent-table");
+            } else if (hasImg && isFirstColHuge) {
+                table.classList.add("media-code-table");
+            } else if (hasPreInFirstCol) {
+                table.classList.add("code-comparison-table");
+            } else if (isFirstColHuge) {
+                table.classList.add("nested-parent-table");
+            } else if (isToxic || hasPre) {
+                table.classList.add("toxic-wide-table");
+                if (table.parentElement && table.parentElement.classList.contains("table-scroll-wrapper")) {
+                    table.parentElement.classList.add("toxic-scroll-wrapper");
+                }
+                rows.forEach((row) => {
+                    if (row.cells.length > 1) row.cells[0].classList.add("toxic-col-left");
+                });
+            } else if (hasImg) {
+                table.classList.add("image-table-layout");
+            }
+        });
+
+    // 9.4 表头修复
+    clone.querySelectorAll("table.image-table-layout, table.multi-image-layout-table").forEach((table) => {
+        const firstRow = table.querySelector("tr");
+        if (firstRow && !firstRow.querySelector("img:not(.inline-small-icon)")) {
+            firstRow.classList.add("pseudo-header-row");
+        }
+    });
+
+    // ==========================================
+    // 10. CSS 收集与绝对化
+    // ==========================================
+    let cssText = '';
+    const styleTags = Array.from(frameDoc.querySelectorAll('style'));
+    for (const style of styleTags) cssText += style.textContent + '\n';
+
+    const links = Array.from(frameDoc.querySelectorAll('link[rel="stylesheet"]'));
+    for (const link of links) {
+        try {
+            if (link.href && !link.href.includes('google') && !link.href.includes('typekit')) {
+                const response = await fetch(link.href);
+                if (response.ok) cssText += await response.text() + '\n';
+            }
+        } catch (e) {}
+    }
+
+    function cssTextToAbsoluteUrls(cssText, baseUrl) {
+        return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, url) => {
+            const raw = url.trim();
+            if (!raw || raw.startsWith("data:") || raw.startsWith("blob:") || raw.startsWith("#")) return match;
+            if (/^https?:\/\//i.test(raw)) return `url(${quote}${raw}${quote})`;
+            try {
+                return `url(${quote}${new URL(raw, baseUrl).href}${quote})`;
+            } catch (e) {
+                return match;
+            }
+        });
+    }
+
+    const processedCss = cssTextToAbsoluteUrls(cssText, baseUrl);
+
+    // ==========================================
+    // 11. 文本清理
+    // ==========================================
+    const walker = frameDoc.createTreeWalker(clone, NodeFilter.SHOW_TEXT, null, false);
+    let node;
+    while ((node = walker.nextNode())) {
+        if (/[\u00A0\u202F\u2007\u2060]/.test(node.nodeValue)) {
+            node.nodeValue = node.nodeValue.replace(/[\u00A0\u202F\u2007\u2060]/g, " ");
+        }
+    }
+
+    clone.querySelectorAll('script, link[rel="stylesheet"], style, meta, title').forEach((el) => el.remove());
+
+    let finalHtml = clone.innerHTML.trim().replace(/&nbsp;/gi, " ").replace(/\u00A0/g, " ");
+
+    // ==========================================
+    // 12. 返回结果
+    // ==========================================
+    const tableSigs = Array.from(clone.querySelectorAll('table')).map(t => {
+        const rows = t.querySelectorAll('tr').length;
+        const firstRow = t.querySelector('tr');
+        const cols = firstRow ? firstRow.children.length : 0;
+        return {
+            classes: Array.from(t.classList || []),
+            isLocator: t.classList && t.classList.contains('locator'),
+            hasColgroup: !!t.querySelector('colgroup'),
+            hasThead: !!t.querySelector('thead'),
+            hasTbody: !!t.querySelector('tbody'),
+            rows,
+            cols
+        };
+    });
+
+    return { 
+        html: finalHtml, 
+        css: processedCss, 
+        tableSigs,
+        tableClasses: {
+            toxicWide: clone.querySelectorAll('.toxic-wide-table').length,
+            nestedParent: clone.querySelectorAll('.nested-parent-table').length,
+            nestedChild: clone.querySelectorAll('.nested-child-table').length,
+            multiImage: clone.querySelectorAll('.multi-image-layout-table').length,
+            codeComparison: clone.querySelectorAll('.code-comparison-table').length,
+            mediaCode: clone.querySelectorAll('.media-code-table').length,
+            imageLayout: clone.querySelectorAll('.image-table-layout').length
+        }
+    };
+}
+
+                
                 """)
 
                 extracted_data = result['html']
                 extracted_css = result.get('css', '')
                 extracted_table_sigs = result.get('tableSigs', [])
+                # 🚀 新增：获取表格分类统计
+                table_classes = result.get('tableClasses', {})
+                if table_classes:
+                    print(f"   📊 表格分类: 毒性宽表={table_classes.get('toxicWide', 0)}, "
+                          f"嵌套父表={table_classes.get('nestedParent', 0)}, "
+                          f"图文表={table_classes.get('multiImage', 0)}, "
+                          f"代码对照表={table_classes.get('codeComparison', 0)}")
+
                 success = True
 
             except Exception as page_error:
@@ -899,7 +1326,437 @@ async def main():
 <head>
     <meta charset="utf-8">
     <title>Siemens NX 文档库</title>
-    <style>{combined_css}</style>
+    <style>{combined_css}
+        
+/* ============================================================================
+   🚀 JS 版功能增强 CSS（完整复刻 nxdoc_scraper_no_img完美版.js）
+   ============================================================================ */
+/* ============================================================================
+   ultra_simple8.py 增强版 CSS 样式
+   完整复刻 nxdoc_scraper_no_img完美版.js 的500+行精准修复
+   使用方法：替换 ultra_simple8.py 中 generate_html 函数的 CSS 部分
+   ============================================================================ */
+
+:root {{
+    --siemens-blue: #009999;
+    --siemens-blue-dark: #007a7a;
+    --bg-color: #ffffff;
+    --text-color: #333333;
+    --sidebar-bg: #f8f9fa;
+    --border-color: #e9ecef;
+    --code-bg: #f6f8fa;
+    --link-color: #0066cc;
+}}
+
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.6;
+    color: var(--text-color);
+    background: var(--bg-color);
+    display: flex;
+    min-height: 100vh;
+}}
+
+/* ==========================================
+   侧边栏样式
+   ========================================== */
+.sidebar {{
+    width: 280px;
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border-color);
+    overflow-y: auto;
+    position: fixed;
+    height: 100vh;
+    left: 0;
+    top: 0;
+    z-index: 100;
+}}
+
+.sidebar-header {{
+    padding: 20px;
+    background: var(--siemens-blue);
+    color: white;
+    font-size: 18px;
+    font-weight: bold;
+    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 101;
+}}
+
+.sidebar-nav ul {{
+    list-style: none;
+    padding: 0;
+}}
+
+.sidebar-nav li {{
+    border-bottom: 1px solid #e0e0e0;
+}}
+
+.sidebar-nav a {{
+    display: block;
+    padding: 12px 20px;
+    color: #333;
+    text-decoration: none;
+    transition: all 0.2s;
+}}
+
+.sidebar-nav a:hover {{
+    background: rgba(0, 153, 153, 0.1);
+    color: var(--siemens-blue);
+}}
+
+.sidebar-nav .active {{
+    background: var(--siemens-blue);
+    color: white !important;
+    font-weight: bold;
+}}
+
+.sidebar-nav .level-1 > a {{
+    font-weight: 600;
+    padding-left: 20px;
+}}
+
+.sidebar-nav .level-2 > a {{
+    padding-left: 40px;
+    font-size: 14px;
+}}
+
+.sidebar-nav .level-3 > a {{
+    padding-left: 60px;
+    font-size: 13px;
+    color: #666;
+}}
+
+/* ==========================================
+   主内容区
+   ========================================== */
+.main-content {{
+    margin-left: 280px;
+    flex: 1;
+    padding: 40px;
+    max-width: 1200px;
+}}
+
+.content-wrapper h1:first-child {{
+    color: var(--siemens-blue);
+    font-size: 32px;
+    margin-bottom: 30px;
+    padding-bottom: 15px;
+    border-bottom: 2px solid var(--siemens-blue);
+}}
+
+.content-wrapper h2 {{
+    color: var(--siemens-blue-dark);
+    font-size: 24px;
+    margin-top: 40px;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-color);
+}}
+
+.content-wrapper h3 {{
+    font-size: 20px;
+    margin-top: 30px;
+    margin-bottom: 15px;
+    color: #444;
+}}
+
+.content-wrapper p {{
+    margin-bottom: 15px;
+    line-height: 1.8;
+}}
+
+.content-wrapper img {{
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 20px auto;
+}}
+
+.content-wrapper pre {{
+    background: var(--code-bg);
+    padding: 15px;
+    border-radius: 5px;
+    overflow-x: auto;
+    margin: 15px 0;
+    border: 1px solid #e1e4e8;
+}}
+
+.content-wrapper code {{
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 14px;
+}}
+
+.content-wrapper a {{
+    color: var(--link-color);
+    text-decoration: none;
+}}
+
+.content-wrapper a:hover {{
+    text-decoration: underline;
+}}
+
+/* ==========================================
+   🚀 表格精准修复系统（6种分类）
+   ========================================== */
+
+/* 基础表格重置 */
+.main-content table {{
+    border-collapse: collapse;
+    margin: 20px 0;
+    width: auto;
+    max-width: 100%;
+}}
+
+/* 1️⃣ 毒性宽表 - 超长文本强制换行 */
+.toxic-wide-table {{
+    table-layout: fixed;
+    width: 100% !important;
+    word-wrap: break-word;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}}
+
+.toxic-wide-table td,
+.toxic-wide-table th {{
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    white-space: normal !important;
+    max-width: 0;
+}}
+
+.toxic-col-left {{
+    width: 30% !important;
+    vertical-align: top;
+}}
+
+.toxic-scroll-wrapper {{
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}}
+
+/* 2️⃣ 嵌套父表格 */
+.nested-parent-table {{
+    table-layout: auto;
+    width: max-content;
+    max-width: 100%;
+}}
+
+.nested-parent-table td {{
+    vertical-align: top;
+    padding: 8px 12px;
+}}
+
+/* 3️⃣ 嵌套子表格 */
+.nested-child-table {{
+    width: 100%;
+    margin: 0;
+    border: none;
+}}
+
+.nested-text-table {{
+    table-layout: auto;
+    width: auto;
+}}
+
+.nested-text-table td,
+.nested-text-table th {{
+    white-space: nowrap;
+    padding: 4px 8px;
+}}
+
+/* 4️⃣ 图文对照表 */
+.multi-image-layout-table {{
+    table-layout: auto;
+    width: max-content;
+    max-width: 100%;
+}}
+
+.multi-image-layout-table td {{
+    vertical-align: middle;
+    padding: 8px;
+}}
+
+.multi-image-layout-table img {{
+    max-width: 200px;
+    height: auto;
+    display: inline-block;
+    margin: 0;
+}}
+
+/* 5️⃣ 代码对照表 */
+.code-comparison-table {{
+    table-layout: fixed;
+    width: 100%;
+}}
+
+.code-comparison-table td {{
+    vertical-align: top;
+    padding: 8px;
+}}
+
+.code-comparison-table pre {{
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+}}
+
+/* 6️⃣ 媒体代码混合表 */
+.media-code-table {{
+    table-layout: auto;
+    width: max-content;
+    max-width: 100%;
+}}
+
+.media-code-table td {{
+    vertical-align: top;
+    padding: 8px;
+}}
+
+/* 图片布局表 */
+.image-table-layout {{
+    table-layout: auto;
+    width: max-content;
+    max-width: 100%;
+}}
+
+.image-table-layout td {{
+    vertical-align: middle;
+    padding: 8px;
+}}
+
+.pseudo-header-row {{
+    font-weight: bold;
+    background: #f8f9fa;
+}}
+
+.pseudo-header-row td {{
+    border-bottom: 2px solid var(--siemens-blue);
+}}
+
+/* 滚动包装器 */
+.table-scroll-wrapper {{
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 15px 0;
+}}
+
+.has-horizontal-scroll {{
+    overflow-x: scroll !important;
+}}
+
+/* 无边框表格 */
+.siemens-table-no-grid {{
+    border: none !important;
+}}
+
+.siemens-table-no-grid td,
+.siemens-table-no-grid th {{
+    border: none !important;
+}}
+
+/* 带边框表格 */
+.siemens-table-with-grid {{
+    border: 1px solid #ddd;
+}}
+
+.siemens-table-with-grid td,
+.siemens-table-with-grid th {{
+    border: 1px solid #ddd;
+    padding: 8px 12px;
+}}
+
+/* ==========================================
+   🌟 小图标保护
+   ========================================== */
+.inline-small-icon {{
+    display: inline !important;
+    vertical-align: middle;
+    max-width: 80px !important;
+    height: auto;
+    margin: 0 4px;
+}}
+
+/* ==========================================
+   🎥 视频播放器修复
+   ========================================== */
+video {{
+    width: 100%;
+    height: auto;
+    aspect-ratio: 16/9;
+    display: block;
+    background: #000;
+    margin: 20px 0;
+}}
+
+disw-video {{
+    display: block;
+    margin: 20px 0;
+}}
+
+.aspectRatioHeightControl {{
+    width: 100%;
+}}
+
+/* 移除 Plyr 残留 */
+.plyr__controls,
+.plyr__control--overlaid,
+.plyr__captions,
+.plyr__poster {{
+    display: none !important;
+}}
+
+/* ==========================================
+   响应式设计
+   ========================================== */
+@media (max-width: 768px) {{
+    .sidebar {{
+        width: 100%;
+        height: auto;
+        position: relative;
+    }}
+
+    .main-content {{
+        margin-left: 0;
+        padding: 20px;
+    }}
+
+    .content-wrapper h1:first-child {{
+        font-size: 24px;
+    }}
+
+    .content-wrapper h2 {{
+        font-size: 20px;
+    }}
+}}
+
+/* ==========================================
+   打印优化
+   ========================================== */
+@media print {{
+    .sidebar {{
+        display: none;
+    }}
+
+    .main-content {{
+        margin-left: 0;
+        padding: 20px;
+    }}
+
+    .content-wrapper a {{
+        color: #000;
+        text-decoration: underline;
+    }}
+
+    .table-scroll-wrapper {{
+        overflow: visible;
+    }}
+}}
+
+</style>
     <style>
         body {{ display: flex; height: 100vh; margin: 0; overflow: hidden; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; color: #333; }}
 
