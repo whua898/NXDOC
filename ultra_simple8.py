@@ -63,6 +63,18 @@ import sqlite3
 import re
 
 # ==========================================
+# 🔧 Windows Console Encoding Fix
+# ==========================================
+# Set stdout encoding to UTF-8 for proper Chinese character display
+if sys.platform == 'win32':
+    try:
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    except:
+        pass
+
+# ==========================================
 # 📋 批量任务配置区 (从 download_list.txt 读取)
 # ==========================================
 
@@ -1143,6 +1155,38 @@ async () => {
 
 
 async def main():
+    global START_URL, SIDEBAR_TITLE, FINAL_OUTPUT_FILE, CACHE_DB_FILE, NAV_JSON_FILE
+    
+    # 如果有多个主题，让用户选择
+    if len(SUBJECTS) > 1:
+        print("\n📋 可用主题列表:")
+        for i, sub in enumerate(SUBJECTS, 1):
+            print(f"   {i}. {sub['title']}")
+        print()
+        
+        choice = input(f"请选择主题 [1-{len(SUBJECTS)}] (默认 1): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(SUBJECTS):
+            selected = SUBJECTS[int(choice) - 1]
+        else:
+            selected = SUBJECTS[0]
+    elif len(SUBJECTS) == 1:
+        selected = SUBJECTS[0]
+    else:
+        print("❌ 没有可处理的主题，请检查 download_list.txt 文件")
+        sys.exit(1)
+    
+    # 动态设置全局变量
+    START_URL = selected['url']
+    SIDEBAR_TITLE = selected['title'].replace(' ', '&nbsp;&nbsp;')
+    FINAL_OUTPUT_FILE = f"{selected['name']}.html"
+    CACHE_DB_FILE = os.path.join(OUTPUT_DIR, f"db_{selected['name']}.db")
+    NAV_JSON_FILE = os.path.join(OUTPUT_DIR, f"nav_{selected['name']}.json")
+    
+    print(f"\n{'='*60}")
+    print(f" 当前主题: {selected['title']}")
+    print(f" 数据库: {CACHE_DB_FILE} |  输出: {FINAL_OUTPUT_FILE}")
+    print(f"{'='*60}\n")
+    
     start_time = time.time()
     stats = ProcessingStats()
     progress = None
