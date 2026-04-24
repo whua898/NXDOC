@@ -1155,35 +1155,67 @@ async () => {
 
 
 async def main():
-    global START_URL, SIDEBAR_TITLE, FINAL_OUTPUT_FILE, CACHE_DB_FILE, NAV_JSON_FILE
-    
-    # 如果有多个主题，让用户选择
-    if len(SUBJECTS) > 1:
-        print("\n📋 可用主题列表:")
-        for i, sub in enumerate(SUBJECTS, 1):
-            print(f"   {i}. {sub['title']}")
-        print()
-        
-        choice = input(f"请选择主题 [1-{len(SUBJECTS)}] (默认 1): ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(SUBJECTS):
-            selected = SUBJECTS[int(choice) - 1]
-        else:
-            selected = SUBJECTS[0]
-    elif len(SUBJECTS) == 1:
-        selected = SUBJECTS[0]
-    else:
+    """
+    主入口函数：批量处理 download_list.txt 中的所有主题（完全复刻 JS 版）
+    """
+    if not SUBJECTS:
         print("❌ 没有可处理的主题，请检查 download_list.txt 文件")
         sys.exit(1)
     
-    # 动态设置全局变量
-    START_URL = selected['url']
-    SIDEBAR_TITLE = selected['title'].replace(' ', '&nbsp;&nbsp;')
-    FINAL_OUTPUT_FILE = f"{selected['name']}.html"
-    CACHE_DB_FILE = os.path.join(OUTPUT_DIR, f"db_{selected['name']}.db")
-    NAV_JSON_FILE = os.path.join(OUTPUT_DIR, f"nav_{selected['name']}.json")
+    print(f"\n📋 从 download_list.txt 读取到 {len(SUBJECTS)} 个主题:")
+    for i, sub in enumerate(SUBJECTS, 1):
+        print(f"   {i}. {sub['title']}")
+    print()
+    
+    # 询问运行模式（全局选择，与 JS 版一致）
+    mode = input("请选择全局运行模式: [a]全自动  [c]续传  [r]重抓  (默认 c): ").strip().lower()
+    if not mode or mode not in ['a', 'c', 'r']:
+        mode = 'c'
+    
+    total_start_time = time.time()
+    
+    # 批量处理所有主题
+    for idx, sub in enumerate(SUBJECTS, 1):
+        print(f"\n\n{'#'*80}")
+        print(f"# 正在处理第 {idx}/{len(SUBJECTS)} 个主题: {sub['title']}")
+        print(f"{'#'*80}")
+        
+        try:
+            await process_single_subject(sub, mode)
+            print(f"\n✅ 主题 '{sub['title']}' 处理完成！")
+        except Exception as e:
+            print(f"\n⚠️ 主题 '{sub['title']}' 发生致命错误，跳过并继续下一个: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    total_elapsed = int((time.time() - total_start_time) / 1500)
+    print(f"\n\n{'='*60}")
+    print(f" 🎉 所有批量任务执行完毕！总耗时: {total_elapsed // 60}分 {total_elapsed % 60}秒")
+    print(f"{'='*60}")
+
+
+async def process_single_subject(sub, mode):
+    """
+    处理单个主题（原 main 函数的核心逻辑）
+    """
+    global START_URL, SIDEBAR_TITLE, FINAL_OUTPUT_FILE, CACHE_DB_FILE, NAV_JSON_FILE
+    
+    # 动态设置变量（与 JS 版一致）
+    START_URL = sub['url']
+    SIDEBAR_TITLE = sub['title'].replace(' ', '&nbsp;&nbsp;')
+    
+    # 创建输出目录
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 生成文件名（与 JS 版一致）
+    FINAL_OUTPUT_FILE = f"{sub['name']}.html"
+    CACHE_DB_FILE = os.path.join(OUTPUT_DIR, f"db_{sub['name']}.db")
+    NAV_JSON_FILE = os.path.join(OUTPUT_DIR, f"nav_{sub['name']}.json")
     
     print(f"\n{'='*60}")
-    print(f" 当前主题: {selected['title']}")
+    print(f" 当前主题: {sub['title']}")
     print(f" 数据库: {CACHE_DB_FILE} |  输出: {FINAL_OUTPUT_FILE}")
     print(f"{'='*60}\n")
     
@@ -1209,11 +1241,6 @@ async def main():
     print("=" * 50)
     print("🚀 NX文档聚合器 - 终极全自动版 (v11.28 修复版：兼容 JS 版生成的 JSON 结构)")
     print("=" * 50)
-    print("[a] 全自动一键探测 (探测结构 + 并发抓取)")
-    print("[c] 增量续传模式 (基于现有 SQLite 恢复)")
-    print("[r] 彻底重抓模式 (清空旧数据从零开始)")
-    mode = input("请选择 [a/c/r] (默认回车为 c 续传): ").strip().lower()
-    if not mode or mode not in ['a', 'c', 'r']: mode = 'c'
 
     # 处理模式选择与旧数据清理
     if mode == 'r':
