@@ -11,6 +11,7 @@
 // 8. [静默运行] 改用 Headless 模式启动，后台运行无干扰，退出自动清理。
 // 9. [上下文修复] 修复 Headless 模式下缺少默认 Context 导致的启动错误。
 // 10. [样式恢复] 将 CSS 样式完全恢复为 ultra_simple7.py 的版本。
+// 11. [批量下载] 支持多个主题的批量下载，资源完全隔离。
 // ==========================================================
 
 const fs = require("fs");
@@ -23,16 +24,59 @@ const sqlite3 = require("sqlite3").verbose();
 // ==========================================
 // ⚙️ 全局配置区
 // ==========================================
-const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.postbuilder/mainmenu_post_postproc_v1";
-// const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/feat_based_mach_fbm_overview";
-// const START_URL = "https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/feat_based_mach_fbm_overview";
-const FINAL_OUTPUT_FILE = "NX12后处理构造器-js.html";
-const CACHE_DIR_NAME = "NX12_pages"; // 仅用于存放 CSS 文件
-const SIDEBAR_TITLE = "NX12&nbsp;&nbsp;后处理构造器";
-const MAX_CONCURRENCY = 9; // 保持较低并发以稳定运行
-const NAV_JSON_FILE = "NX12_nav_structure.json";
-const CACHE_DB_FILE = "NX12_pages.db";
+// ==========================================
+// 📋 批量任务配置区 (从 download_list.txt 读取)
+// ==========================================
 
+function loadSubjectsFromFile(filename = "download_list.txt") {
+    try {
+        const content = fs.readFileSync(filename, 'utf8');
+        const lines = content.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+
+        const subjects = [];
+        // 每两行为一组：标题 + URL
+        for (let i = 0; i < lines.length; i += 2) {
+            if (i + 1 < lines.length) {
+                const title = lines[i];
+                const url = lines[i + 1];
+
+                // 生成安全的名称
+                const name = title.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, '_');
+
+                if (url.startsWith('http') && title.length > 0) {
+                    subjects.push({
+                        name: name,
+                        url: url,
+                        title: title
+                    });
+                }
+            }
+        }
+
+        return subjects;
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            console.error(`❌ 配置文件 ${filename} 不存在，请创建 download_list.txt 文件`);
+        } else {
+            console.error(`❌ 读取配置文件出错: ${error.message}`);
+        }
+        return [];
+    }
+}
+
+const SUBJECTS = loadSubjectsFromFile();
+
+// 动态变量声明（原常量改为 let）
+let START_URL = "";
+let FINAL_OUTPUT_FILE = "";
+let CACHE_DIR_NAME = "NX12_pages"; // 保持固定
+let SIDEBAR_TITLE = "";
+let MAX_CONCURRENCY = 9; // 保持较低并发以稳定运行
+let NAV_JSON_FILE = "";
+let CACHE_DB_FILE = "";
+let OUTPUT_DIR = "output"; // 专门的输出目录
+
+// 固定常量保持不变
 const CACHE_DIR = path.join(__dirname, CACHE_DIR_NAME);
 const TARGET_IFRAME_SELECTOR = "#xhtml";
 const md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
@@ -174,7 +218,7 @@ async function capturePageContent(page) {
         // 页脚关键词清理 - 移除相关链接块
         const footerKeywords = [
             'Learn more', 'How do I', 'Look up more details', 'See also', 'See Also',
-            'Related Concepts', 'Related Reference', 'Related Topics', 'Related Tasks', 
+            'Related Concepts', 'Related Reference', 'Related Topics', 'Related Tasks',
             'Related Information', 'Related Links',
             '相关概念', '相关参考', '相关主题', '相关任务', '相关信息', '相关链接',
             '了解更多', '如何操作', '如何...', '查找更多详细信息', '另请参见'
@@ -201,15 +245,25 @@ async function capturePageContent(page) {
         // 获取正文
         const container = document.querySelector('div.doc-content') || document.body;
 
+        // 🔥 关键修复：克隆节点并移除造成额外边框的容器包装器
+        const clone = container.cloneNode(true);
+
+        // 移除容器包装器的边框相关样式
+        const containerWrappers = clone.querySelectorAll('.main.content-container, .content-container, .doc-content');
+        containerWrappers.forEach(wrapper => {
+            // 只清空样式，不增加任何东西
+            wrapper.style.cssText = 'border:none !important; box-shadow:none !important; margin:0 !important; padding:0 !important;';
+        });
+
         // 处理图片链接
         const baseUrl = document.baseURI;
-        container.querySelectorAll('img, a').forEach(el => {
+        clone.querySelectorAll('img, a').forEach(el => {
             if (el.hasAttribute('src')) el.src = new URL(el.getAttribute('src'), baseUrl).href;
             if (el.hasAttribute('href')) el.href = new URL(el.getAttribute('href'), baseUrl).href;
         });
 
         return {
-            html: container.innerHTML.trim(),
+            html: clone.innerHTML.trim(),
             docClass: container.className,
             mainClass: container.id
         };
@@ -275,28 +329,38 @@ function askUser(query) {
 }
 
 // ==========================================
-// 🚀 主程序
+// 🚀 核心逻辑封装
 // ==========================================
 
-(async () => {
+async function startJob(sub, mode) {
+    // 1. 初始化当前任务的变量
+    START_URL = sub.url;
+    SIDEBAR_TITLE = sub.title;
+
+    // 创建输出目录
+    if (!fs.existsSync(OUTPUT_DIR)) {
+        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    }
+
+    FINAL_OUTPUT_FILE = `${sub.name}.html`;
+    CACHE_DB_FILE = path.join(OUTPUT_DIR, `db_${sub.name}.db`);
+    NAV_JSON_FILE = path.join(OUTPUT_DIR, `nav_${sub.name}.json`);
+
+    console.log(`\n\n${"=".repeat(60)}`);
+    console.log(` 当前主题: ${sub.title}`);
+    console.log(` 数据库: ${CACHE_DB_FILE} |  输出: ${FINAL_OUTPUT_FILE}`);
+    console.log(`${"=".repeat(60)}`);
+
+    // --- 以下是原有主程序逻辑 ---
     const scriptStartTime = Date.now(); // 🚀 记录整个脚本的开始时间
     let realFetchStartTime = 0;   // 第一次真实抓取的时间
     let realFetchCount = 0;       // 真实抓取计数
-
-    console.clear();
-    console.log("============================================================");
-    console.log("🚀 NX文档抓取器 (V121 - 样式完全恢复版)");
-    console.log("============================================================");
 
     if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
     const db = initDatabase();
     const dbCount = await getDatabaseStats(db);
     console.log(`📊 数据库当前记录数: ${dbCount}`);
-
-    // 极简一行流，绝不撑爆屏幕
-    const modeInput = await askUser("\n🚀 请选择运行模式: [a]全自动  [c]续传(跳过已存)  [r]重抓清空库 👉 (默认 c): ");
-    const mode = modeInput.trim().toLowerCase() || "c";
 
     if (mode === "r") {
         console.log("🗑️ 清空数据库...");
@@ -601,53 +665,142 @@ function askUser(query) {
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>${SIDEBAR_TITLE}</title>
 `);
     writeStream.write(`    <style>\n`);
+
+    // === 优先写入原始页面CSS（最高优先级）===
     const allStyles = await new Promise(r => db.all("SELECT content FROM styles", (e, rows) => r(rows || [])));
     allStyles.forEach(row => writeStream.write(row.content + "\n"));
 
-    // 满血版核心 CSS，单括号，完美层级与符号修复
-    const uiCss = `
-        body { display: flex; height: 100vh; margin: 0; overflow: hidden; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; color: #333; }
+    // === 分隔线：以下是UI框架样式 ===
+    writeStream.write(`\n/* ====================================================================
+   UI框架样式开始 - 仅包含必需的布局和导航样式
+   原则：最小化干预，优先保留原文样式
+   ==================================================================== */
+`);
 
-        .nx-sidebar { width: 340px; min-width: 250px; display: flex; flex-direction: column; background: #f8f9fa; border-right: 1px solid #dee2e6; }
-
-        .nx-sidebar-header { padding: 15px 10px; background: #f8f9fa; border-bottom: 2px solid #007cba; flex-shrink: 0; }
-        .nx-sidebar-content { flex: 1; overflow-y: auto; padding: 5px; }
-
-        .resizer { width: 5px; cursor: col-resize; background: #dee2e6; transition: background 0.2s; }
-        .resizer:hover { background: #007cba; }
-        .main-content { flex: 1; overflow-y: auto; scroll-behavior: smooth; padding: 0; background: #fff; line-height: 1.6; }
-        .content-wrapper { max-width: 100%; margin: 0 auto; padding: 40px; }
-
-        /* 优化点：统一正文主标题颜色 */
-        .content-wrapper h1 { font-size: 32px !important; color: #007cba !important; font-weight: bold; margin-bottom: 15px; }
-        .content-wrapper h2 { color: #007cba !important; }
-
-        /* 修复点：彻底移除所有针对表格的强制样式，完全依赖页面自带 CSS */
-
-        .nx-sidebar ul, .nx-sidebar ul.root-list { list-style: none; margin: 0; padding: 0; }
-        .nx-sidebar li { margin: 2px 0; padding: 0; }
-
-        .nav-item-row { display: flex; align-items: flex-start; margin: 2px 0; }
-
+    // === 最小化UI框架CSS（仅必需的布局样式）===
+    const uiFrameworkCss = `
+        /* 侧边栏容器 - 最小化样式 */
+        .nx-sidebar { 
+            width: 340px; 
+            min-width: 250px; 
+            display: flex; 
+            flex-direction: column; 
+            background: #f8f9fa; 
+            border-right: 1px solid #dee2e6; 
+        }
+        
+        /* 侧边栏头部 */
+        .nx-sidebar-header { 
+            padding: 15px 10px; 
+            background: #f8f9fa; 
+            border-bottom: 2px solid #007cba; 
+            flex-shrink: 0; 
+        }
+        
+        /* 侧边栏内容区 */
+        .nx-sidebar-content { 
+            flex: 1; 
+            overflow-y: auto; 
+            padding: 5px; 
+        }
+        
+        /* 拖拽分隔条 */
+        .resizer { 
+            width: 5px; 
+            cursor: col-resize; 
+            background: #dee2e6; 
+            transition: background 0.2s; 
+        }
+        .resizer:hover { 
+            background: #007cba; 
+        }
+        
+        /* 主内容区域 */
+        .main-content { 
+            flex: 1; 
+            min-width: 0; 
+            overflow-y: auto; 
+            overflow-x: hidden; /* 关键：主容器禁止横向滚动，只让内部 table 滚动 */
+            background: #fff;
+            position: relative;
+        }
+        
+        /* 内容包装器 - 最小化干预 */
+        .content-wrapper { 
+            max-width: 100% !important; 
+            margin: 0 auto !important; 
+            padding: 10px !important; 
+        }
+        
+        /* 通用超宽表格处理 - 允许横向滚动 */
+        .main-content .content-wrapper:has(table:not(.locator):not(.navigator)) {
+            overflow-x: auto;
+        }
+        
+        /* 导航目录基础样式 - 避免与原文冲突 */
+        .nx-sidebar ul, 
+        .nx-sidebar ul.root-list { 
+            list-style: none; 
+            margin: 0; 
+            padding: 0; 
+        }
+        
+        .nx-sidebar li { 
+            margin: 2px 0; 
+            padding: 0; 
+        }
+        
+        .nav-item-row { 
+            display: flex; 
+            align-items: flex-start; 
+            margin: 2px 0; 
+        }
+        
+        /* 嵌套列表 - 使用更具体的选择器避免冲突 */
         ul.nested { 
             display: none; 
-            padding-left: 0px !important;
-            border-left: 1px solid #888 !important;
-            margin-left: 6px !important; 
+            padding-left: 0px;
+            border-left: 1px solid #888;
+            margin-left: 6px; 
             margin-top: 2px;
             margin-bottom: 2px; 
         }
-        ul.active { display: block; }
-
-        .caret { cursor: pointer; display: inline-block; width: 14px; min-width: 14px; color: #666; font-size: 10px; margin-top: 6px; text-align: center; }
-        .caret::before { content: "▶"; display: inline-block; transition: transform 0.2s; }
-        .caret-down::before { transform: rotate(90deg); }
-        .no-caret { display: inline-block; width: 14px; min-width: 14px; }
-
-        .nx-sidebar a, .nav-text { 
+        ul.active { 
+            display: block; 
+        }
+        
+        /* 展开收起符号 */
+        .caret { 
+            cursor: pointer; 
+            display: inline-block; 
+            width: 14px; 
+            min-width: 14px; 
+            color: #666; 
+            font-size: 10px; 
+            margin-top: 6px; 
+            text-align: center; 
+        }
+        .caret::before { 
+            content: "▶"; 
+            display: inline-block; 
+            transition: transform 0.2s; 
+        }
+        .caret-down::before { 
+            transform: rotate(90deg); 
+        }
+        .no-caret { 
+            display: inline-block; 
+            width: 14px; 
+            min-width: 14px; 
+        }
+        
+        /* 导航链接样式 - 避免影响页面内容链接 */
+        .nx-sidebar a, 
+        .nav-text { 
             text-decoration: none; 
             color: #005f87;
             padding: 3px 6px; 
@@ -659,63 +812,197 @@ function askUser(query) {
             flex: 1; 
             cursor: pointer;
         }
-
+        
+        /* 各层级导航样式 */
         .nav-level-0 > .nav-item-row > a, 
-        .nav-level-0 > .nav-item-row > span.nav-text { font-size: 14px; font-weight: 700; padding-top: 5px; padding-bottom: 5px; }
-
+        .nav-level-0 > .nav-item-row > span.nav-text { 
+            font-size: 14px; 
+            font-weight: 700; 
+            padding-top: 5px; 
+            padding-bottom: 5px; 
+        }
+        
         .nav-level-1 > .nav-item-row > a, 
-        .nav-level-1 > .nav-item-row > span.nav-text { font-size: 13px; font-weight: 600; }
-
+        .nav-level-1 > .nav-item-row > span.nav-text { 
+            font-size: 13px; 
+            font-weight: 600; 
+        }
+        
         .nav-level-2 > .nav-item-row > a, 
-        .nav-level-2 > .nav-item-row > span.nav-text { font-size: 13px; }
-
-        .nav-level-3 > .nav-item-row > a, .nav-level-3 > .nav-item-row > span.nav-text,
-        .nav-level-4 > .nav-item-row > a, .nav-level-4 > .nav-item-row > span.nav-text,
-        .nav-level-5 > .nav-item-row > a, .nav-level-5 > .nav-item-row > span.nav-text { font-size: 12px; }
-
-        .nx-sidebar a:hover, .folder-text:hover { background: #e2e8f0; color: #005a84; }
-        /* 优化点：调整选中目录项的背景色 */
-        .selected-link { background: #ADD8E6 !important; color: #000 !important; font-weight: 600 !important; }
-
-        .page-section { margin-bottom: 80px; padding-top: 30px; border-top: 2px solid #eaeaea; }
-        .page-section:first-child { border-top: none; padding-top: 0; }
-
-        /* --- REV 2026-02-19 #06: table readability (offline) --- */
-        /* 1) no-class：尽量保持单元格不乱换行；同时允许横向滚动兜底。 */
-        .main-content table:not([class]) td,
-        .main-content table:not([class]) th {
-            white-space: nowrap;
+        .nav-level-2 > .nav-item-row > span.nav-text { 
+            font-size: 13px; 
         }
-        .main-content .content-wrapper:has(table:not([class])) {
+        
+        .nav-level-3 > .nav-item-row > a, 
+        .nav-level-3 > .nav-item-row > span.nav-text,
+        .nav-level-4 > .nav-item-row > a, 
+        .nav-level-4 > .nav-item-row > span.nav-text,
+        .nav-level-5 > .nav-item-row > a, 
+        .nav-level-5 > .nav-item-row > span.nav-text { 
+            font-size: 12px; 
+        }
+        
+        /* 交互状态样式 */
+        .nx-sidebar a:hover, 
+        .folder-text:hover { 
+            background: #e2e8f0; 
+            color: #005a84; 
+        }
+        
+        /* 选中项样式 */
+        .selected-link { 
+            background: #ADD8E6 !important; 
+            color: #000 !important; 
+            font-weight: 600 !important; 
+        }
+        
+        /* 内容区域基础样式 */
+        .page-section { 
+            margin-bottom: 80px; 
+            padding-top: 30px; 
+            border-top: 2px solid #eaeaea; 
+        }
+        .page-section:first-child { 
+            border-top: none; 
+            padding-top: 0; 
+        }
+`;
+
+    writeStream.write(uiFrameworkCss);
+
+    // === 分隔线：异常修正样式 ===
+    writeStream.write(`
+/* ====================================================================
+   异常修正样式 - 仅针对具体问题进行精准修正
+   原则：只修正确实存在问题的样式，使用!important确保效果
+   ==================================================================== */
+`);
+
+    // === 异常修正CSS（针对具体问题的精准修正）===
+    const exceptionFixCss = `
+
+        /* 正文主标题 */
+        .content-wrapper h1 { 
+            font-size: 32px !important; 
+            color: #007cba !important; 
+            font-weight: bold; 
+            margin-bottom: 15px; 
+        }
+
+        /* 基础容器清理（仅限 wrapper） */
+        .content-wrapper {
+            border: none !important;
+            box-shadow: none !important;
+            outline: none !important;
+            max-width: 100% !important;
+        }
+
+        /* 页面分区允许横向滚动（由父容器承担滚动职责） */
+        .page-section {
             overflow-x: auto;
         }
 
-        /* 2) navigator：同样避免换行导致的“表格竖排”。 */
-        .main-content table.navigator td,
-        .main-content table.navigator th {
-            white-space: nowrap;
-        }
-        .main-content .content-wrapper:has(table.navigator) {
-            overflow-x: auto;
+        /* 表格保持原始语义与边框 */
+        .page-section table {
+            display: table !important;
+            width: auto !important;
+            max-width: none !important;
         }
 
-        /* 3) locator：常见于“位于何处?”这类两列小表。 */
-        .main-content table.locator {
-            table-layout: auto;
-            width: max-content;
-            max-width: 100%;
+        /* 防止长路径撑爆容器 */
+        .page-section ul,
+        .page-section ol,
+        .page-section p,
+        .page-section span {
+            word-wrap: break-word !important;
+            word-break: break-all !important;
+            white-space: normal !important;
         }
-        .main-content table.locator td,
-        .main-content table.locator th {
-            white-space: nowrap;
+
+        /* Locator 表格独立控制 */
+        table.locator {
+            display: table !important;
+            table-layout: auto !important;
+            max-width: 100% !important;
         }
-        .main-content .content-wrapper:has(table.locator) {
+        
+        /* 内层滚动容器 */
+        .section-inner {
             overflow-x: auto;
         }
-    `;
+        
+        .section-inner pre {
+            display: block !important;
+            position: relative !important;   /* 关键修复 */
+            white-space: pre !important;
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+        }
+        
+`;
 
-    writeStream.write(`${uiCss}
-    </style>
+    writeStream.write(exceptionFixCss);
+
+    // === 最重要的修复：body样式必须放在最后确保优先级 ===
+    writeStream.write(`
+/* ====================================================================
+   关键修复：body布局样式（必须放在最后）
+   ==================================================================== */
+        
+        /* 基础布局结构 - 必须使用!important覆盖所有原始样式 */
+        body { 
+            display: flex !important; 
+            height: 100vh !important; 
+            margin: 0 !important; 
+            overflow: visible !important;  /* 允许页面滚动 */
+        }
+`);
+
+
+// ✅ locator 第一列补丁 —— 只能放在这里
+writeStream.write(`
+/* ====================================================================
+   Locator 表格第一列宽度异常修复（唯一合法位置）
+   ==================================================================== */
+        
+        table.locator {
+            display: table !important;
+            table-layout: auto !important;
+            width: auto !important;
+            max-width: 100% !important;
+        }
+        
+        table.locator td:first-child,
+        table.locator th:first-child {
+            white-space: nowrap !important;
+            width: auto !important;
+            max-width: none !important;
+        }
+        
+        table.locator td:first-child *,
+        table.locator th:first-child * {
+            max-width: none !important;
+            width: auto !important;
+            min-width: auto !important;
+            white-space: nowrap !important;
+            word-break: keep-all !important;
+            word-wrap: normal !important;
+        }
+        
+        table.locator td:first-child code,
+        table.locator td:first-child pre {
+            display: inline !important;
+            max-width: none !important;
+            white-space: nowrap !important;
+        }
+`);
+    
+    // === 结束样式标签 ===
+    writeStream.write(`
+/* ====================================================================
+   样式定义结束
+   ==================================================================== */
+</style>
 </head>
 <body>
 `);
@@ -755,7 +1042,11 @@ function askUser(query) {
                 .trim();
 
             if (cleanHtml) {
-                writeStream.write(`            <div class="page-section" id="page_${currentPageIndex}">${cleanHtml}</div>\n`);
+                writeStream.write(`            <div class="page-section" id="page_${currentPageIndex}">\n`);
+                writeStream.write(`                <div class="section-inner">\n`);
+                writeStream.write(`                    ${cleanHtml}\n`);
+                writeStream.write(`                </div>\n`);
+                writeStream.write(`            </div>\n`);
                 validPageCount++;
             }
         } else {
@@ -814,30 +1105,119 @@ function askUser(query) {
 </body>
 </html>`;
 
-    writeStream.end(async () => {
-        console.log('✅ 文件主体写入完成');
-        try {
-            console.log('📝 开始追加结束标签与JS代码...');
-            // 写入结束标签及 JS 代码
-            fs.appendFileSync(FINAL_OUTPUT_FILE, `        </div>\n    </div>\n${uiJs}`, 'utf8');
-            console.log('✅ 代码追加完成');
-        } catch (appendError) {
-            console.error('❌ 追加代码失败:', appendError.message);
-        }
+    // 使用Promise确保文件写入完成后再追加JavaScript
+    await new Promise((resolve, reject) => {
+        writeStream.end((err) => {
+            if (err) {
+                reject(err);
+                return;
+            }
 
-        console.log(`✅ 成功写入 ${validPageCount} 个页面内容`);
-        console.log(`🎉 文件已生成: ${FINAL_OUTPUT_FILE}`);
-        
-        // 🚀 修复：计算整个脚本的总耗时
-        const endTime = Date.now();
-        const totalElapsedMs = endTime - scriptStartTime;  // 使用脚本开始时间
-        const totalElapsedSec = Math.floor(totalElapsedMs / 1000);
-        const mins = Math.floor(totalElapsedSec / 60);
-        const secs = totalElapsedSec % 60;
-        console.log(`⏱️ 总耗时: ${mins}分 ${secs}秒`);
-        
-        db.close();
-        process.exit();
+            console.log('✅ 文件主体写入完成');
+
+            // 先关闭数据库连接
+            db.close();
+
+            // 然后追加JavaScript代码
+            try {
+                console.log('📝 开始追加结束标签与JS代码...');
+                console.log('📝 uiJs 长度:', uiJs.length);
+                console.log('📝 替换后长度:', uiJs.replace('</body>\n</html>', '').length);
+
+                // 写入结束标签及 JS 代码
+                fs.appendFileSync(FINAL_OUTPUT_FILE, `        </div>\n    </div>\n${uiJs.replace('</body>\n</html>', '')}`, 'utf8');
+                console.log('✅ 代码追加完成');
+
+                // 验证文件末尾内容
+                const finalContent = fs.readFileSync(FINAL_OUTPUT_FILE, 'utf8');
+                console.log('📝 文件末尾200字符:', finalContent.slice(-200));
+
+                console.log(`✅ 成功写入页面内容`);
+                console.log(`🎉 文件已生成: ${FINAL_OUTPUT_FILE}`);
+
+                // 🚀 修复：计算整个脚本的总耗时
+                const endTime = Date.now();
+                const totalElapsedMs = endTime - scriptStartTime;  // 使用脚本开始时间
+                const totalElapsedSec = Math.floor(totalElapsedMs / 1000);
+                const mins = Math.floor(totalElapsedSec / 60);
+                const secs = totalElapsedSec % 60;
+                console.log(`⏱️ 总耗时: ${mins}分 ${secs}秒`);
+
+                console.log(`✅ 主题 [${sub.name}] 处理完毕！\n`);
+
+                resolve();
+            } catch (appendError) {
+                console.error('❌ 追加代码失败:', appendError.message);
+                console.error('❌ 错误堆栈:', appendError.stack);
+                reject(appendError);
+            }
+        });
+    });
+}
+
+// ==========================================
+// 🚀 真正的程序入口
+// ==========================================
+
+// 添加用户输入函数
+function askUser(question) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
     });
 
+    return new Promise((resolve) => {
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
+}
+
+(async () => {
+    console.clear();
+    console.log("============================================================");
+    console.log(" NX文档批量抓取系统 (V121 - Multi-Subject)");
+    console.log("============================================================");
+    console.log("💡 请先准备好 download_list.txt 配置文件，示例：");
+    console.log("   NX12 后处理构造器");
+    console.log("   https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.postbuilder/mainmenu_post_postproc_v1");
+    console.log("============================================================");
+
+    // 检查配置文件
+    if (!fs.existsSync("download_list.txt")) {
+        console.error("❌ 请先创建 download_list.txt 配置文件！");
+        console.error("文件格式：每两行为一组");
+        console.error("第一行：主题标题");
+        console.error("第二行：对应URL");
+        console.error("\n示例：");
+        console.error("NX12 后处理构造器");
+        console.error("https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.postbuilder/mainmenu_post_postproc_v1");
+        process.exit(1);
+    }
+
+    if (SUBJECTS.length === 0) {
+        console.error("❌ download_list.txt 文件中没有找到有效的主题配置");
+        process.exit(1);
+    }
+
+    // 只需要询问一次模式，应用于所有任务
+    const modeInput = await askUser("\n 请选择全局运行模式: [a]全自动  [c]续传  [r]重抓  (默认 c): ");
+    const mode = modeInput.trim().toLowerCase() || "c";
+
+    const totalStartTime = Date.now();
+
+    for (const sub of SUBJECTS) {
+        try {
+            await startJob(sub, mode);
+        } catch (err) {
+            console.error(`\n 主题 [${sub.name}] 发生致命错误，跳过并继续下一个:`, err.message);
+        }
+    }
+
+    const totalElapsed = Math.floor((Date.now() - totalStartTime) / 1000);
+    console.log(`\n\n${"=".repeat(60)}`);
+    console.log(` 所有批量任务执行完毕！总耗时: ${Math.floor(totalElapsed / 60)}分 ${totalElapsed % 60}秒`);
+    console.log(`${"=".repeat(60)}`);
+    process.exit(0);
 })();
