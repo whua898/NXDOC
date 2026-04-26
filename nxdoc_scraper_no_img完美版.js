@@ -973,9 +973,15 @@ async function startJob(sub, mode) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
 
-  FINAL_OUTPUT_FILE = path.join(`${sub.name}.html`);
-  CACHE_DB_FILE = path.join(OUTPUT_DIR, `db_${sub.name}.db`);
-  NAV_JSON_FILE = path.join(OUTPUT_DIR, `nav_${sub.name}.json`);
+  // HTML 文件直接放在 output/ 根目录
+  FINAL_OUTPUT_FILE = path.join(OUTPUT_DIR, `${sub.name}.html`);
+  // 数据库和 JSON 文件放在 output/data/ 子目录
+  const DATA_DIR = path.join(OUTPUT_DIR, "data");
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  CACHE_DB_FILE = path.join(DATA_DIR, `db_${sub.name}.db`);
+  NAV_JSON_FILE = path.join(DATA_DIR, `nav_${sub.name}.json`);
 
   console.log(`\n\n${"=".repeat(60)}`);
   console.log(` 当前主题: ${sub.title}`);

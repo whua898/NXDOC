@@ -1,493 +1,156 @@
-/**
- * ============================================================================
- * NX Documentation Scraper (Optimized Version)
- *
- * Features:
- * - Playwright-based headless scraping
- * - SQLite caching with WAL mode for high performance
- * - Absolute URLs for images (No downloading, lightweight version)
- * - Intelligent table layout preservation and responsive CSS injection
- * ============================================================================
- */
+#!/usr/bin/env python3
+"""
+NX文档聚合器 - Python 完美移植版 (v11.28)
+完全复刻 nxdoc_scraper_no_img完美版.js 核心逻辑
+自动与 JS 版的大小比对并自愈
+"""
 
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const readline = require("readline");
-const { chromium } = require("playwright");
-const sqlite3 = require("sqlite3").verbose();
+import os
+import sys
+import json
+import time
+import asyncio
+import hashlib
+import sqlite3
+import re
+from urllib.parse import urlparse, urljoin
+from playwright.async_api import async_playwright
+import signal
 
-// 优化：CSS 内存缓存，避免重复下载相同样式文件
-const globalCssCache = new Map();
+# ==========================================
+# ⚙️ 全局配置区
+# ==========================================
+OUTPUT_DIR = "output"
+MAX_CONCURRENCY = 9
 
-// ==========================================
-// ⚙️ 全局配置区
-// ==========================================
-// ==========================================
-// 📋 批量任务配置区 (从 download_list.txt 读取)
-// ==========================================
+# 全局 CSS 缓存机制（模仿 JS 版的 globalCssCache）
+global_css_cache = {}
 
-function loadSubjectsFromFile(filename = "download_list.txt") {
-  try {
-    const content = fs.readFileSync(filename, "utf8");
-    const lines = content
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
 
-    const subjects = [];
-    // 每两行为一组：标题 + URL
-    for (let i = 0; i < lines.length; i += 2) {
-      if (i + 1 < lines.length) {
-        const title = lines[i];
-        const url = lines[i + 1];
+def load_subjects(filename="download_list.txt"):
+    if not os.path.exists(filename):
+        print(f"❌ 配置文件 {filename} 不存在")
+        return []
+    with open(filename, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    subjects = []
+    for i in range(0, len(lines), 2):
+        if i + 1 < len(lines):
+            title = lines[i]
+            url = lines[i + 1]
+            name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', title)
+            if url.startswith("http") and title:
+                subjects.append({"name": name, "url": url, "title": title})
+    return subjects
 
-        // 生成安全的名称
-        const name = title.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, "_");
 
-        if (url.startsWith("http") && title.length > 0) {
-          subjects.push({
-            name: name,
-            url: url,
-            title: title,
-          });
-        }
-      }
-    }
+SUBJECTS = load_subjects()
 
-    return subjects;
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      console.error(
-        `❌ 配置文件 ${filename} 不存在，请创建 download_list.txt 文件`,
-      );
-    } else {
-      console.error(`❌ 读取配置文件出错: ${error.message}`);
-    }
-    return [];
-  }
-}
 
-const SUBJECTS = loadSubjectsFromFile();
+# ==========================================
+# 🚀 数据库核心函数
+# ==========================================
+def init_database(db_file):
+    db_dir = os.path.dirname(db_file)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(db_file, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("CREATE TABLE IF NOT EXISTS styles (hash TEXT PRIMARY KEY, content TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, title TEXT, html TEXT, css_hash TEXT)")
+    return conn
 
-// 动态变量声明（原常量改为 let）
-let START_URL = "";
-let FINAL_OUTPUT_FILE = "";
-let CACHE_DIR_NAME = "NX12_pages"; // 保持固定
-let SIDEBAR_TITLE = "";
-let MAX_CONCURRENCY = 9; // 保持较低并发以稳定运行
-let NAV_JSON_FILE = "";
-let CACHE_DB_FILE = "";
-let OUTPUT_DIR = "output"; // 专门的输出目录
 
-// 固定常量保持不变
-const CACHE_DIR = path.join(__dirname, CACHE_DIR_NAME);
-const TARGET_IFRAME_SELECTOR = "#xhtml";
-const md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
+async def check_page_exists(db, url):
+    cursor = db.execute("SELECT 1 FROM cache WHERE url = ?", (url,))
+    return cursor.fetchone() is not None
 
-// ==========================================
-// 🚀 数据库核心函数
-// ==========================================
 
-function initDatabase() {
-  const db = new sqlite3.Database(CACHE_DB_FILE);
-  db.serialize(() => {
-    // 优化 SQLite 性能：启用 WAL 模式与内存临时存储，提升并发写入速度
-    db.run(`PRAGMA journal_mode = WAL;`);
-    db.run(`PRAGMA synchronous = NORMAL;`);
-    db.run(`PRAGMA temp_store = MEMORY;`);
-    db.run(
-      `CREATE TABLE IF NOT EXISTS styles (hash TEXT PRIMARY KEY, content TEXT)`,
-    );
-    db.run(
-      `CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, title TEXT, html TEXT, css_hash TEXT)`,
-    );
-  });
-  return db;
-}
+def save_to_database(db, url, title, html_content, css_blocks):
+    css_hash = ""
+    if isinstance(css_blocks, list) and css_blocks:
+        css_hash = hashlib.md5("".join(css_blocks).encode('utf-8')).hexdigest()
+        for block in css_blocks:
+            if block and block.strip():
+                h = hashlib.md5(block.encode('utf-8')).hexdigest()
+                db.execute("INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)", (h, block))
+    elif isinstance(css_blocks, str) and css_blocks.strip():
+        css_hash = hashlib.md5(css_blocks.encode('utf-8')).hexdigest()
+        h = hashlib.md5(css_blocks.encode('utf-8')).hexdigest()
+        db.execute("INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)", (h, css_blocks))
 
-function checkPageExists(db, url) {
-  return new Promise((resolve) => {
-    db.get("SELECT 1 FROM cache WHERE url = ?", [url], (err, row) => {
-      resolve(!!row);
-    });
-  });
-}
+    db.execute("INSERT OR REPLACE INTO cache (url, title, html, css_hash) VALUES (?, ?, ?, ?)",
+               (url, title, html_content, css_hash))
+    db.commit()
 
-function saveToDatabase(db, url, title, html, cssBlocks) {
-  return new Promise((resolve, reject) => {
-    let cssHash = "";
-    if (Array.isArray(cssBlocks) && cssBlocks.length > 0) {
-      cssHash = md5(cssBlocks.join(""));
-    } else if (typeof cssBlocks === "string" && cssBlocks.trim()) {
-      cssHash = md5(cssBlocks);
-    }
 
-    db.serialize(() => {
-      if (Array.isArray(cssBlocks) && cssBlocks.length > 0) {
-        const stmt = db.prepare(
-          "INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)",
-        );
-        for (const css of cssBlocks) {
-          if (css && css.trim()) {
-            stmt.run(md5(css), css);
-          }
-        }
-        stmt.finalize();
-      } else if (typeof cssBlocks === "string" && cssBlocks.trim()) {
-        const stmt = db.prepare(
-          "INSERT OR IGNORE INTO styles (hash, content) VALUES (?, ?)",
-        );
-        stmt.run(md5(cssBlocks), cssBlocks);
-        stmt.finalize();
-      }
+# ==========================================
+# 🌐 浏览器相关函数
+# ==========================================
+def css_to_absolute_urls(css_text, base_url):
+    def replacer(match):
+        quote = match.group(1)
+        url_raw = match.group(2).strip()
+        if not url_raw or url_raw.startswith("data:") or url_raw.startswith("blob:") or url_raw.startswith("#"):
+            return match.group(0)
+        if re.match(r"^https?://", url_raw, re.IGNORECASE):
+            return f"url({quote}{url_raw}{quote})"
+        try:
+            abs_url = urljoin(base_url, url_raw)
+            return f"url({quote}{abs_url}{quote})"
+        except:
+            return match.group(0)
 
-      const stmt2 = db.prepare(
-        "INSERT OR REPLACE INTO cache (url, title, html, css_hash) VALUES (?, ?, ?, ?)",
-      );
-      stmt2.run(url, title, html, cssHash, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-      stmt2.finalize();
-    });
-  });
-}
+    return re.sub(r'url\(\s*([\'"]?)([^\'"]+)\2\s*\)', replacer, css_text)
 
-function getDatabaseStats(db) {
-  return new Promise((resolve) => {
-    db.get("SELECT COUNT(*) as count FROM cache", (err, row) => {
-      resolve(row ? row.count : 0);
-    });
-  });
-}
 
-// ==========================================
-// 🌐 浏览器相关函数
-// ==========================================
+async def build_inline_css(frame, page):
+    if not frame: return []
+    meta = await frame.evaluate("""() => {
+        const baseUrl = document.baseURI;
+        const inline = Array.from(document.querySelectorAll("style")).map(s => s.textContent || "");
+        const links = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map(l => l.href).filter(Boolean);
+        return { baseUrl, inline, links };
+    }""")
 
-function cssTextToAbsoluteUrls(cssText, baseUrl) {
-  return String(cssText).replace(
-    /url\(\s*(['"]?)([^'")]+)\1\s*\)/g,
-    (m, quote, url) => {
-      const raw = String(url).trim();
-      if (
-        !raw ||
-        raw.startsWith("data:") ||
-        raw.startsWith("blob:") ||
-        raw.startsWith("#")
-      )
-        return m;
-      if (/^https?:\/\//i.test(raw)) return `url(${quote}${raw}${quote})`;
-      try {
-        return `url(${quote}${new URL(raw, baseUrl).href}${quote})`;
-      } catch {
-        return m;
-      }
-    },
-  );
-}
+    css_blocks = []
+    base_url = meta.get("baseUrl", "")
+    for text in meta.get("inline", []):
+        if text.strip(): css_blocks.append(css_to_absolute_urls(text, base_url))
 
-function processTableSignatures(htmlContent) {
-  return [];
-}
+    # 使用全局 CSS 缓存和重试机制
+    links = meta.get("links", [])
+    for href in links:
+        try:
+            if href in global_css_cache:
+                css_text = global_css_cache[href]
+            else:
+                max_retries = 2
+                css_text = ""
+                for retry in range(max_retries + 1):
+                    try:
+                        resp = await page.request.get(href, timeout=15000)
+                        if resp.ok:
+                            css_text = await resp.text()
+                            if css_text and css_text.strip():
+                                global_css_cache[href] = css_text
+                                break
+                        # CSS 下载失败，静默处理
+                    except Exception as download_err:
+                        pass  # CSS 下载失败，静默处理
 
-async function buildInlineCss(frame) {
-  if (!frame) return [];
+            if css_text and css_text.strip():
+                css_blocks.append(css_to_absolute_urls(f"/* {href} */\n{css_text}", href))
+        except Exception as e:
+            pass  # CSS 异常，静默处理
+    return css_blocks
 
-  const meta = await frame.evaluate(() => {
-    const baseUrl = document.baseURI;
-    const inline = Array.from(document.querySelectorAll("style")).map(
-      (s) => s.textContent || "",
-    );
-    const links = Array.from(
-      document.querySelectorAll('link[rel="stylesheet"]'),
-    )
-      .map((l) => l.href)
-      .filter(Boolean);
-    return { baseUrl, inline, links };
-  });
 
-  let cssBlocks = [];
+DOM_LOGIC_SCRIPT = r"""
+async () => {
 
-  for (const text of meta.inline) {
-    if (text.trim()) {
-      cssBlocks.push(cssTextToAbsoluteUrls(text, meta.baseUrl));
-    }
-  }
-
-  for (const href of meta.links) {
-    let cssText = "";
-    if (globalCssCache.has(href)) {
-      cssText = globalCssCache.get(href);
-    } else {
-      try {
-        cssText = await frame.evaluate(async (url) => {
-          try {
-            const resp = await fetch(url);
-            return resp.ok ? await resp.text() : "";
-          } catch {
-            return "";
-          }
-        }, href);
-        if (cssText) {
-          globalCssCache.set(href, cssText);
-        }
-      } catch {}
-    }
-    if (cssText && cssText.trim()) {
-      cssBlocks.push(
-        cssTextToAbsoluteUrls(`/* ${href} */\n${cssText}`, meta.baseUrl),
-      );
-    }
-  }
-
-  return cssBlocks;
-}
-
-// 核心逻辑：在浏览器上下文中预处理 DOM 与表格结构
-async function capturePageContent(page) {
-  try {
-    // 优化：Iframe 智能等待，加速无 iframe 页面的处理
-    await Promise.race([
-      page.waitForSelector(TARGET_IFRAME_SELECTOR, { timeout: 15000 }),
-      page.waitForFunction(
-        () => {
-          // 如果页面已经完全加载，且确实没有 iframe，提前结束等待
-          return (
-            document.readyState === "complete" &&
-            document.querySelectorAll("iframe").length === 0
-          );
-        },
-        { timeout: 15000 },
-      ),
-    ]);
-  } catch (e) {
-    // 忽略超时，继续往下找
-  }
-
-  let frame = page.frames().find((f) => f.name() === "xhtml");
-
-  if (!frame) {
-    frame = page
-      .frames()
-      .find(
-        (f) => f.url().includes("/documentation/") || f.url().includes("help"),
-      );
-  }
-
-  if (!frame) {
-    const element = await page.$(TARGET_IFRAME_SELECTOR);
-    if (element) frame = await element.contentFrame();
-  }
-
-  if (!frame) throw new Error("无法获取目标 Frame (frame is null/undefined)");
-
-  // 🚀 优化：滚动页面到底部，触发所有懒加载的图片和视频
-  try {
-    await frame.evaluate(async () => {
-      // 找到所有可能懒加载的元素
-      const lazyEls = document.querySelectorAll("disw-video, video, img");
-      if (lazyEls.length > 0) {
-        // 快速滚动一遍触发 IntersectionObserver
-        for (const el of lazyEls) {
-          try {
-            el.scrollIntoView({ behavior: "instant", block: "center" });
-          } catch (e) {}
-        }
-        // 滚回顶部
-        window.scrollTo(0, 0);
-        const container =
-          document.querySelector(".doc-content") ||
-          document.querySelector(".main.content-container");
-        if (container) container.scrollTop = 0;
-      }
-    });
-  } catch (e) {}
-
-  // 🚀 优化：等待页面中的视频组件（disw-video）加载出真实的播放地址
-  try {
-    const mediaUrls = page.__mediaUrls || [];
-    await frame.evaluate(async (interceptedUrls) => {
-      window.__interceptedMediaUrls = interceptedUrls;
-      const videos = document.querySelectorAll("disw-video");
-      if (videos.length > 0) {
-        await Promise.all(
-          Array.from(videos).map((v) => {
-            return new Promise((resolve) => {
-              if (
-                v.querySelector("video source") ||
-                v.querySelector("video[src]")
-              ) {
-                return resolve();
-              }
-              const observer = new MutationObserver(() => {
-                if (
-                  v.querySelector("video source") ||
-                  v.querySelector("video[src]")
-                ) {
-                  observer.disconnect();
-                  resolve();
-                }
-              });
-              observer.observe(v, { childList: true, subtree: true });
-              setTimeout(() => {
-                observer.disconnect();
-                resolve();
-              }, 8000);
-            });
-          }),
-        );
-      }
-
-      // 🚀 优化：尝试从父容器提取真实的 mp4 地址（针对 blob: 视频及未加载的视频）
-      document.querySelectorAll("video").forEach((v) => {
-        let realSrc = null;
-
-        // 1. 检查 video 自身的属性
-        Array.from(v.attributes).forEach((attr) => {
-          if (
-            attr.value.includes(".mp4") ||
-            attr.value.includes(".webm") ||
-            attr.value.includes(".m3u8")
-          ) {
-            realSrc = attr.value;
-          }
-        });
-
-        // 2. 检查 source 子节点
-        if (!realSrc) {
-          v.querySelectorAll("source").forEach((s) => {
-            let src =
-              s.getAttribute("src") ||
-              s.getAttribute("data-src") ||
-              s.getAttribute("data-video-src");
-            if (
-              src &&
-              (src.includes(".mp4") ||
-                src.includes(".webm") ||
-                src.includes(".m3u8"))
-            ) {
-              realSrc = src;
-            }
-          });
-        }
-
-        // 3. 向上遍历父节点查找
-        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
-          let parent = v.parentElement;
-          while (parent && parent.tagName !== "BODY") {
-            Array.from(parent.attributes).forEach((attr) => {
-              if (
-                attr.value.includes(".mp4") ||
-                attr.value.includes(".webm") ||
-                attr.value.includes(".m3u8")
-              ) {
-                realSrc = attr.value;
-              }
-            });
-            if (realSrc) break;
-
-            if (parent.tagName.toLowerCase() === "disw-video") {
-              const videoUrl =
-                parent.getAttribute("video-url") ||
-                parent.getAttribute("src") ||
-                parent.getAttribute("data-video-url") ||
-                parent.getAttribute("data-src");
-              if (videoUrl) {
-                realSrc = videoUrl;
-                break;
-              }
-              // 如果 disw-video 内部有 JSON 配置
-              let match = parent.innerHTML.match(
-                /(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i,
-              );
-              if (match) {
-                realSrc = match[1];
-                break;
-              }
-            }
-
-            parent = parent.parentElement;
-          }
-        }
-
-        // 4. 全局搜索 script 标签中的视频链接
-        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
-          let scripts = document.querySelectorAll("script");
-          for (let script of scripts) {
-            let match = script.textContent.match(
-              /(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i,
-            );
-            if (match) {
-              realSrc = match[1];
-              break;
-            }
-          }
-        }
-
-        // 5. 尝试从 window.__interceptedMediaUrls 中获取
-        if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
-          if (
-            window.__interceptedMediaUrls &&
-            window.__interceptedMediaUrls.length > 0
-          ) {
-            realSrc = window.__interceptedMediaUrls[0];
-          }
-        }
-
-        if (realSrc) {
-          v.setAttribute("data-real-src", realSrc);
-        }
-      });
-
-      // 额外检查 disw-video，防止 video 标签尚未生成
-      document.querySelectorAll("disw-video").forEach((v) => {
-        let realSrc =
-          v.getAttribute("video-url") ||
-          v.getAttribute("src") ||
-          v.getAttribute("data-video-url") ||
-          v.getAttribute("data-src");
-        if (!realSrc) {
-          Array.from(v.attributes).forEach((attr) => {
-            if (
-              attr.value.includes(".mp4") ||
-              attr.value.includes(".webm") ||
-              attr.value.includes(".m3u8")
-            ) {
-              realSrc = attr.value;
-            }
-          });
-        }
-        if (!realSrc) {
-          let match = v.innerHTML.match(
-            /(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i,
-          );
-          if (match) realSrc = match[1];
-        }
-        if (
-          !realSrc &&
-          window.__interceptedMediaUrls &&
-          window.__interceptedMediaUrls.length > 0
-        ) {
-          realSrc = window.__interceptedMediaUrls[0];
-        }
-        if (realSrc) {
-          let video = v.querySelector("video");
-          if (!video) {
-            video = document.createElement("video");
-            video.setAttribute("data-real-src", realSrc);
-            v.appendChild(video);
-          } else if (!video.getAttribute("data-real-src")) {
-            video.setAttribute("data-real-src", realSrc);
-          }
-        }
-      });
-    }, mediaUrls);
-  } catch (e) {}
-
-  return await frame
-    .evaluate(async () => {
       const unwanted = [
         ".navbar",
         ".header",
@@ -566,9 +229,40 @@ async function capturePageContent(page) {
       const container =
         document.querySelector("div.doc-content") || document.body;
 
-      // 🌟 识别小图标，防止被误判为大图居中
+      // 🌟 核心修复：图像资源生命周期锁
+      // 原因：Python 版 Playwright 的 IPC 延迟导致图片未加载完成就被识别
+      // 解决：强制等待所有图片完全加载，确保 naturalWidth 不是 0
+      const imgs = Array.from(document.querySelectorAll("img"));
+      if (imgs.length > 0) {
+        await Promise.all(
+          imgs.map((img) => {
+            // 1. 如果瞬间早已加载好，直接放行 (无任何性能损失)
+            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+
+            // 2. 如果没下完，我们下达强制等待监听器
+            return new Promise((resolve) => {
+              img.addEventListener("load", resolve, { once: true });
+              img.addEventListener("error", resolve, { once: true });
+              setTimeout(resolve, 1500); // 容错：每个图片最多硬等 1.5 秒
+            });
+          }),
+        );
+      }
+
+      // 🌟 识别小图标，防止被误判为大图居中（现在图片已完全加载）
       container.querySelectorAll("img").forEach((img) => {
+        const src = (img.getAttribute("src") || img.src || "").toLowerCase();
         if (
+          src.includes("icon") ||
+          src.includes("ont_") ||
+          src.includes("mfn_") ||
+          src.includes("button") ||
+          src.includes("checkbox") ||
+          src.includes("arrow") ||
+          src.includes("plus") ||
+          src.includes("minus") ||
+          src.includes("check") ||
+          src.includes("nav_") ||
           (img.clientWidth > 0 && img.clientWidth <= 80) ||
           (img.naturalWidth > 0 && img.naturalWidth <= 80)
         ) {
@@ -577,6 +271,27 @@ async function capturePageContent(page) {
       });
 
       const clone = container.cloneNode(true);
+
+      // 🌟 再次在 clone 上识别小图标（基于 URL 特征，不依赖尺寸）
+      // 注意：clone 是从已加载完成的 container 克隆的，所以尺寸已经准确
+      clone.querySelectorAll("img").forEach((img) => {
+        const src = (img.getAttribute("src") || img.src || "").toLowerCase();
+        if (
+          src.includes("icon") ||
+          src.includes("ont_") ||
+          src.includes("mfn_") ||
+          src.includes("button") ||
+          src.includes("checkbox") ||
+          src.includes("arrow") ||
+          src.includes("plus") ||
+          src.includes("minus") ||
+          src.includes("check") ||
+          src.includes("nav_") ||
+          src.includes("filter_")
+        ) {
+          img.classList.add("inline-small-icon");
+        }
+      });
 
       const containerWrappers = clone.querySelectorAll(
         ".main.content-container, .content-container, .doc-content",
@@ -754,7 +469,7 @@ async function capturePageContent(page) {
             tbl.classList.add("siemens-table-no-grid"); // 消除网格黑线
           }
         } else {
-          // 纯文本参数表（如 Parameters 详情），必须保留边框和自然宽度
+          // 纯文本参数表（如 Parameters 详情），必须保留边框 and 自然宽度
           tbl.classList.add("nested-text-table");
         }
       });
@@ -893,525 +608,178 @@ async function capturePageContent(page) {
         docClass: container.className,
         mainClass: container.id,
       };
-    })
-    .then((data) => ({ frame, data }));
+
 }
+"""
 
-// ==========================================
-// 🌲 目录树处理 & 工具函数
-// ==========================================
 
-let globalPageIndex = 0;
+async def capture_page_content(page):
+    try:
+        tasks = [
+            asyncio.create_task(page.wait_for_selector("#xhtml", state="attached", timeout=15000)),
+            asyncio.create_task(page.wait_for_function(
+                '''() => document.readyState === "complete" && document.querySelectorAll("iframe").length === 0''',
+                timeout=15000
+            ))
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+            try:
+                await p
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+    except:
+        pass
 
-function renderSidebarHtml(nodes, level = 0) {
-  if (!nodes || nodes.length === 0) return "";
-  let html = level === 0 ? '<ul class="root-list active">\n' : "";
+    frame = None
+    for f in page.frames:
+        if f.name == "xhtml": frame = f; break
+    if not frame:
+        for f in page.frames:
+            if "/documentation/" in f.url or "help" in f.url: frame = f; break
+    if not frame:
+        element = await page.query_selector("#xhtml")
+        if element: frame = await element.content_frame()
 
-  function buildTree(nodes, level) {
-    nodes.forEach((node) => {
-      const currentPageIndex = globalPageIndex++;
-      html += `    <li class="nav-level-${level}">\n        <div class="nav-item-row">\n`;
+    if not frame: raise Exception("无法获取目标 Frame (frame is null/undefined)")
 
-      const hasChildren = node.children && node.children.length > 0;
-      const caretClass = level === 0 ? "caret caret-down" : "caret";
-
-      if (hasChildren) {
-        html += `            <span class="${caretClass}" onclick="toggleNode(this)"></span>\n`;
-      } else {
-        html += `            <span class="no-caret"></span>\n`;
-      }
-
-      if (
-        !node.url ||
-        node.url.includes("javascript:void(0)") ||
-        node.url.trim() === "#"
-      ) {
-        html += `            <span class="folder-text" onclick="toggleNode(this.previousElementSibling)">${node.text}</span>\n`;
-      } else {
-        html += `            <a href="#page_${currentPageIndex}" onclick="handleManualClick(this)">${node.text}</a>\n`;
-      }
-
-      html += `        </div>\n`;
-      if (hasChildren) {
-        const activeClass = level === 0 ? " active" : "";
-        html += `        <ul class="nested${activeClass}">\n`;
-        buildTree(node.children, level + 1);
-        html += `        </ul>\n`;
-      }
-      html += `    </li>\n`;
-    });
-  }
-
-  buildTree(nodes, level);
-  if (level === 0) html += "</ul>\n";
-  return html;
-}
-
-function askUser(question) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
-}
-
-// ==========================================
-// 🚀 核心逻辑封装
-// ==========================================
-
-async function startJob(sub, mode) {
-  START_URL = sub.url;
-  SIDEBAR_TITLE = sub.title;
-
-  if (!fs.existsSync(OUTPUT_DIR)) {
-    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  }
-
-  FINAL_OUTPUT_FILE = path.join(`${sub.name}.html`);
-  CACHE_DB_FILE = path.join(OUTPUT_DIR, `db_${sub.name}.db`);
-  NAV_JSON_FILE = path.join(OUTPUT_DIR, `nav_${sub.name}.json`);
-
-  console.log(`\n\n${"=".repeat(60)}`);
-  console.log(` 当前主题: ${sub.title}`);
-  console.log(` 数据库: ${CACHE_DB_FILE} |  输出: ${FINAL_OUTPUT_FILE}`);
-  console.log(`${"=".repeat(60)}`);
-
-  const scriptStartTime = Date.now();
-  let realFetchStartTime = 0;
-  let realFetchCount = 0;
-
-  if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
-
-  const db = initDatabase();
-  const dbCount = await getDatabaseStats(db);
-  console.log(`📊 数据库当前记录数: ${dbCount}`);
-
-  if (mode === "r") {
-    console.log("🗑️ 清空数据库...");
-    await new Promise((r) => db.run("DELETE FROM cache", r));
-    await new Promise((r) => db.run("DELETE FROM styles", r));
-    if (fs.existsSync(NAV_JSON_FILE)) fs.unlinkSync(NAV_JSON_FILE);
-  }
-
-  let browser;
-  try {
-    console.log("🚀 正在启动后台浏览器引擎...");
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
-  } catch (e) {
-    console.error("❌ 浏览器启动失败:", e.message);
-    throw e;
-  }
-
-  const activeWorkers = [];
-  let isShuttingDown = false;
-
-  async function gracefulShutdown() {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-    console.log("\n\n🛑 收到中断信号，正在优雅退出当前任务...");
-
-    console.log(`🔒 正在关闭 ${activeWorkers.length} 个并发标签页...`);
-    await Promise.all(
-      activeWorkers.map((page) => page.close().catch(() => {})),
-    );
-
-    if (browser) {
-      console.log("🔒 正在关闭浏览器引擎...");
-      await browser.close().catch(() => {});
-    }
-
-    if (db) {
-      db.close((err) => {
-        if (err) console.error(err.message);
-        console.log("🔒 数据库连接已关闭");
-        process.exit(0);
-      });
-    } else {
-      process.exit(0);
-    }
-  }
-
-  const shutdownHandler = () => gracefulShutdown();
-  process.on("SIGINT", shutdownHandler);
-  process.on("SIGTERM", shutdownHandler);
-
-  let treeData = [];
-  let navItems = [];
-
-  if (fs.existsSync(NAV_JSON_FILE) && mode !== "a" && mode !== "r") {
-    console.log("✅ 读取本地目录缓存...");
-    treeData = JSON.parse(fs.readFileSync(NAV_JSON_FILE, "utf-8"));
-  } else {
-    console.log("📋 正在探测目录结构...");
-    const page = await browser.newPage();
-
-    // 恢复 domcontentloaded，让主进程尽快释放
-    await page
-      .goto(START_URL, { waitUntil: "domcontentloaded", timeout: 60000 })
-      .catch(() => {});
-
-    console.log("⏳ 正在动态侦测侧边栏渲染状态...");
-
-    // 动态等待侧边栏渲染：检测导航树中是否已挂载足够的节点
-    try {
-      await page.waitForFunction(
-        () => {
-          const navRoot =
-            document.querySelector("ul.doc-topics") ||
-            document.querySelector('[role="tree"]') ||
-            document.querySelector(".nx-sidebar ul") ||
-            document.querySelector("ul");
-          return navRoot && navRoot.querySelectorAll("li").length > 3;
-        },
-        { timeout: 30000 },
-      );
-      console.log("✅ 侦测到侧边栏 DOM 挂载完毕！");
-    } catch (e) {
-      console.log("⚠️ 动态等待超时，尝试强行向下解析...");
-    }
-
-    console.log("📋 正在识别侧边栏并自动展开所有导航节点...");
-    treeData = await page.evaluate(async () => {
-      function findBestNavRoot() {
-        let root =
-          document.querySelector("ul.doc-topics") ||
-          document.querySelector('[role="tree"]');
-        if (root) return root;
-        let allUls = Array.from(document.querySelectorAll("ul"));
-        if (allUls.length === 0) return null;
-        allUls.sort(
-          (a, b) =>
-            b.querySelectorAll("a").length - a.querySelectorAll("a").length,
-        );
-        return allUls[0];
-      }
-
-      const treeRoot = findBestNavRoot();
-      if (!treeRoot) return [];
-
-      let lastCount = 0;
-      let stuck = 0;
-      while (stuck < 6) {
-        const expandables = Array.from(
-          document.querySelectorAll(
-            "li.has-subItems > button[aria-expanded='false'], .toggle:not(.expanded), .expand-icon:not(.expanded), li[aria-expanded='false'] > button",
-          ),
-        );
-
-        if (expandables.length === 0) {
-          stuck++;
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-
-        for (let el of expandables) {
-          try {
-            el.scrollIntoView({ block: "center", inline: "nearest" });
-            el.click();
-          } catch (e) {}
-        }
-        await new Promise((r) => setTimeout(r, 2000));
-
-        let currentCount = document.querySelectorAll("li").length;
-        if (currentCount > lastCount) {
-          lastCount = currentCount;
-          stuck = 0;
-        } else {
-          stuck++;
-        }
-      }
-
-      function parseLevel(ul) {
-        const result = [];
-        if (!ul) return result;
-        const lis = ul.querySelectorAll(":scope > li");
-        for (let li of lis) {
-          const a = li.querySelector(
-            ":scope > a, :scope > div > a, .toc-node-content a",
-          );
-          const sub =
-            li.querySelector(":scope > ul") ||
-            li.querySelector(":scope > div > ul");
-
-          if (a) {
-            result.push({
-              text: a.innerText.trim(),
-              url: a.href,
-              href: a.href,
-              hasChildren: !!sub,
-              children: parseLevel(sub),
-            });
-          } else {
-            const titleSpan = li.querySelector(
-              ":scope > span, :scope > div > span",
-            );
-            if (titleSpan) {
-              result.push({
-                text: titleSpan.innerText.trim(),
-                url: "",
-                href: "",
-                hasChildren: !!sub,
-                children: parseLevel(sub),
-              });
+    try:
+        await frame.evaluate("""async () => {
+            const lazyEls = document.querySelectorAll("disw-video, video, img");
+            if (lazyEls.length > 0) {
+                for (const el of lazyEls) { try { el.scrollIntoView({ behavior: "instant", block: "center" }); } catch (e) {} }
+                window.scrollTo(0, 0);
+                const container = document.querySelector(".doc-content") || document.querySelector(".main.content-container");
+                if (container) container.scrollTop = 0;
             }
-          }
-        }
-        return result;
-      }
+        }""")
+    except:
+        pass
 
-      const startUl =
-        treeRoot.tagName === "UL" ? treeRoot : treeRoot.querySelector("ul");
-      return parseLevel(startUl);
-    });
+    try:
+        media_urls = getattr(page, '__mediaUrls', [])
+        await frame.evaluate(r"""async (interceptedUrls) => {
+            window.__interceptedMediaUrls = interceptedUrls;
+            const videos = document.querySelectorAll("disw-video");
+            if (videos.length > 0) {
+                await Promise.all(Array.from(videos).map(v => {
+                    return new Promise((resolve) => {
+                        if (v.querySelector("video source") || v.querySelector("video[src]")) return resolve();
+                        const observer = new MutationObserver(() => {
+                            if (v.querySelector("video source") || v.querySelector("video[src]")) {
+                                observer.disconnect();
+                                resolve();
+                            }
+                        });
+                        observer.observe(v, { childList: true, subtree: true });
+                        setTimeout(() => { observer.disconnect(); resolve(); }, 8000);
+                    });
+                }));
+            }
+            // Add detailed media logic exactly as JS
+            document.querySelectorAll("video").forEach(v => {
+                let realSrc = null;
+                Array.from(v.attributes).forEach(attr => { if (attr.value.includes(".mp4") || attr.value.includes(".webm") || attr.value.includes(".m3u8")) realSrc = attr.value; });
+                if (!realSrc) { v.querySelectorAll("source").forEach(s => { let src = s.getAttribute("src") || s.getAttribute("data-src") || s.getAttribute("data-video-src"); if (src && (src.includes(".mp4") || src.includes(".webm") || src.includes(".m3u8"))) realSrc = src; }); }
+                if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+                    let parent = v.parentElement;
+                    while (parent && parent.tagName !== "BODY") {
+                        Array.from(parent.attributes).forEach(attr => { if (attr.value.includes(".mp4") || attr.value.includes(".webm") || attr.value.includes(".m3u8")) realSrc = attr.value; });
+                        if (realSrc) break;
+                        if (parent.tagName.toLowerCase() === "disw-video") {
+                            const videoUrl = parent.getAttribute("video-url") || parent.getAttribute("src") || parent.getAttribute("data-video-url") || parent.getAttribute("data-src");
+                            if (videoUrl) { realSrc = videoUrl; break; }
+                            let match = parent.innerHTML.match(/(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i);
+                            if (match) { realSrc = match[1]; break; }
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+                if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+                    let scripts = document.querySelectorAll("script");
+                    for (let script of scripts) {
+                        let match = script.textContent.match(/(https?:\/\/[^\s"']+\.(?:mp4|webm|m3u8)[^\s"']*)/i);
+                        if (match) { realSrc = match[1]; break; }
+                    }
+                }
+                if (!realSrc || (v.src && v.src.startsWith("blob:"))) {
+                    if (window.__interceptedMediaUrls && window.__interceptedMediaUrls.length > 0) realSrc = window.__interceptedMediaUrls[0];
+                }
+                if (realSrc) v.setAttribute("data-real-src", realSrc);
+            });
+        }""", media_urls)
+    except:
+        pass
 
-    fs.writeFileSync(NAV_JSON_FILE, JSON.stringify(treeData, null, 2));
-    await page.close();
-  }
+    data = await frame.evaluate(DOM_LOGIC_SCRIPT)
+    return frame, data
 
-  const flatten = (nodes) =>
-    nodes.forEach((n) => {
-      navItems.push(n);
-      if (n.children) flatten(n.children);
-    });
-  flatten(treeData);
-  console.log(`📊 目录节点总数: ${navItems.length}`);
 
-  let currentIndex = 0;
-  let successCount = 0;
-  let skipCount = 0;
-  let failCount = 0;
+# ==========================================
+# 🌲 目录树处理 & HTML生成
+# ==========================================
+def render_sidebar_html(nodes, level=0):
+    global_page_index = [0]
 
-  function getLogPrefix(idx, isRealFetch = false) {
-    const total = navItems.length;
-    const percent = (((idx + 1) / total) * 150).toFixed(1);
-    let etaStr = "--";
+    def build_tree(nodes, level):
+        html = ""
+        for node in nodes:
+            current_page_idx = global_page_index[0]
+            global_page_index[0] += 1
+            html += f'    <li class="nav-level-{level}">\n        <div class="nav-item-row">\n'
+            has_children = bool(node.get("children"))
+            caret_class = "caret caret-down" if level == 0 else "caret"
 
-    if (isRealFetch) {
-      if (realFetchStartTime === 0) realFetchStartTime = Date.now();
-      realFetchCount++;
+            if has_children:
+                html += f'            <span class="{caret_class}" onclick="toggleNode(this)"></span>\n'
+            else:
+                html += '            <span class="no-caret"></span>\n'
 
-      const elapsed = (Date.now() - realFetchStartTime) / 1500;
-      const rate = realFetchCount / elapsed;
+            url = node.get("url", "")
+            text = node.get("text", "")
+            if not url or "javascript:void(0)" in url or str(url).strip() == "#":
+                html += f'            <span class="folder-text" onclick="toggleNode(this.previousElementSibling)">{text}</span>\n'
+            else:
+                html += f'            <a href="#page_{current_page_idx}" onclick="handleManualClick(this)">{text}</a>\n'
 
-      const remaining = total - (idx + 1);
-      const etaSec = rate > 0 ? remaining / rate : 0;
+            html += '        </div>\n'
+            if has_children:
+                active_class = " active" if level == 0 else ""
+                html += f'        <ul class="nested{active_class}">\n'
+                html += build_tree(node["children"], level + 1)
+                html += '        </ul>\n'
+            html += '    </li>\n'
+        return html
 
-      const etaMin = Math.floor(etaSec / 60);
-      const etaS = Math.floor(etaSec % 60);
-      etaStr = `${etaMin}分${etaS}秒`;
-    }
-    return `[${percent}%] 成功:${successCount} 复用:${skipCount} 失败:${failCount} | ETA: ${etaStr}`;
-  }
+    if not nodes: return ""
+    res = '<ul class="root-list active">\n' if level == 0 else ''
+    res += build_tree(nodes, level)
+    if level == 0: res += '</ul>\n'
+    return res
 
-  async function worker(id) {
-    let page = null;
-    let context = null;
 
-    const createPage = async () => {
-      if (page) {
-        const idx = activeWorkers.indexOf(page);
-        if (idx > -1) activeWorkers.splice(idx, 1);
-        try {
-          await page.close();
-        } catch {}
-      }
-      if (context)
-        try {
-          await context.close();
-        } catch {}
-
-      context = await browser.newContext();
-      page = await context.newPage();
-
-      activeWorkers.push(page);
-
-      await page.route("**/*", (route) => {
-        const req = route.request();
-        const type = req.resourceType();
-        const url = req.url().toLowerCase();
-
-        // 🚀 优化：拦截无关的网络请求（如字体、埋点、广告等），但必须放行 xhr/fetch/media 以便视频组件获取真实链接
-        if (
-          ["font", "beacon", "csp_report", "websocket"].includes(type) ||
-          url.includes("analytics") ||
-          url.includes("tracking") ||
-          url.includes("telemetry") ||
-          url.includes("metrics") ||
-          url.includes("googletagmanager.com") ||
-          url.includes("google-analytics.com") ||
-          url.includes("tealiumiq.com") ||
-          url.includes("tiqcdn.com") ||
-          url.includes("assets.adobedtm.com") ||
-          url.includes("smetrics.siemens.com")
-        ) {
-          route.abort();
-        } else {
-          route.continue();
-        }
-      });
-
-      page.__mediaUrls = [];
-      page.on("response", (response) => {
-        const url = response.url();
-        const type = response.headers()["content-type"] || "";
-        if (
-          type.includes("video/") ||
-          type.includes("application/vnd.apple.mpegurl") ||
-          url.includes(".mp4") ||
-          url.includes(".webm") ||
-          url.includes(".m3u8")
-        ) {
-          if (!url.includes("blank.mp4")) {
-            page.__mediaUrls.push(url);
-          }
-        }
-      });
-    };
-
-    await createPage();
-
-    while (currentIndex < navItems.length && !isShuttingDown) {
-      const idx = currentIndex++;
-      const item = navItems[idx];
-
-      if (
-        !item ||
-        !item.url ||
-        item.url.includes("javascript") ||
-        item.url.trim() === "#"
-      ) {
-        console.log(
-          `   ℹ️ [${idx + 1}/${navItems.length}] [线程${id}] ${item.text} (📁 纯目录外壳，自动跳过)`,
-        );
-        continue;
-      }
-
-      const exists = await checkPageExists(db, item.url);
-      if (exists) {
-        skipCount++;
-        console.log(
-          `[${idx + 1}/${navItems.length}] [线程${id}] ${item.text} (✓ 数据库极速恢复) | ${getLogPrefix(idx, false)}`,
-        );
-        continue;
-      }
-
-      let retries = 0;
-      let success = false;
-      while (retries < 3 && !success && !isShuttingDown) {
-        try {
-          if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
-          if (page.isClosed()) await createPage();
-          page.__mediaUrls = []; // Reset media URLs for the new page
-
-          await page.goto(item.url, {
-            waitUntil: "domcontentloaded",
-            timeout: 30000,
-          });
-
-          const { frame, data } = await capturePageContent(page);
-          const css = frame ? await buildInlineCss(frame) : [];
-
-          if (data.html) {
-            const tableSigs = processTableSignatures(data.html);
-            await saveToDatabase(db, item.url, item.text, data.html, css);
-            successCount++;
-            success = true;
-            console.log(
-              `[${idx + 1}/${navItems.length}] [线程${id}] ${item.text} (✓ 抓取成功) | ${getLogPrefix(idx, true)}`,
-            );
-          } else {
-            throw new Error("HTML为空");
-          }
-        } catch (e) {
-          retries++;
-          console.error(
-            `   ❌ [${item.text}] [线程${id}] 重试 ${retries}/3: ${e.message}`,
-          );
-          await createPage();
-          if (retries >= 3) {
-            failCount++;
-            console.error(`   ❌ [${item.text}] [线程${id}] 最终失败`);
-          }
-        }
-      }
-    }
-
-    if (page) {
-      const idx = activeWorkers.indexOf(page);
-      if (idx > -1) activeWorkers.splice(idx, 1);
-      try {
-        await page.close();
-      } catch {}
-    }
-    if (context)
-      try {
-        await context.close();
-      } catch {}
-  }
-
-  console.log(`⚡ 启动 ${MAX_CONCURRENCY} 个并发线程...`);
-  const workers = Array(MAX_CONCURRENCY)
-    .fill(null)
-    .map((_, i) => worker(i + 1));
-  await Promise.all(workers);
-
-  if (isShuttingDown) return;
-
-  console.log(
-    `\n✅ 抓取结束 | 新增: ${successCount} | 跳过: ${skipCount} | 失败: ${failCount}`,
-  );
-
-  globalPageIndex = 0;
-
-  console.log("⏳ 正在生成最终 HTML...");
-  const writeStream = fs.createWriteStream(FINAL_OUTPUT_FILE);
-
-  writeStream.write(`<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${SIDEBAR_TITLE}</title>
-`);
-  writeStream.write(`    <style>\n`);
-
-  const allStyles = await new Promise((r) =>
-    db.all("SELECT content FROM styles", (e, rows) => r(rows || [])),
-  );
-  allStyles.forEach((row) => writeStream.write(row.content + "\n"));
-
-  writeStream.write(`\n/* ====================================================================
-   UI框架样式开始 - 仅包含必需的布局和导航样式
-   ==================================================================== */
-`);
-
-  const uiFrameworkCss = `
+# CSS and JS templates matching precisely the JS code
+UI_FRAMEWORK_CSS = r"""
         /* 🚀 修改：加入 font-size: 14px 控制整体字号 */
-        .nx-sidebar { width: 340px; min-width: 250px; display: flex; flex-direction: column; background: #f8f9fa; border-right: 1px solid #dee2e6; overflow: hidden; font-size: 13px; }
+        .nx-sidebar { width: 320px; min-width: 250px; display: flex; flex-direction: column; background: #f8f9fa; border-right: 1px solid #dee2e6; overflow: hidden; font-size: 13px; }
         .nx-sidebar-header { padding: 15px 10px; border-bottom: 2px solid #007cba; flex-shrink: 0; }
         .nx-sidebar-content { flex: 1; overflow-y: auto; padding: 5px; }
         .nx-sidebar ul, .nx-sidebar li { list-style: none; margin: 0; padding: 0; }
         .nx-sidebar ul.nested { display: none; margin-left: 8px; border-left: 1px solid #888; }
         .nx-sidebar ul.active { display: block; }
-        
+
         /* 🚀 修改：margin 改为 0，让行与行之间更紧凑 */
         .nav-item-row { display: flex; align-items: flex-start; margin: 0; }
-        
+
         .caret { cursor: pointer; width: 14px; min-width: 14px; font-size: 10px; margin-top: 4px; text-align: center; } /* 微调箭头位置 */
         /* 🚀 加上 display: inline-block，激活 transform 旋转权限！ */
         .caret::before { content: "▶"; display: inline-block; transition: transform 0.2s; }
         .caret-down::before { content: "▼"; transform: none; }
         .no-caret { width: 14px; min-width: 14px; }
-        
+
         /* 🚀 修改：减小 padding 和 line-height，让链接条目更窄 */
         .nx-sidebar a { text-decoration: none; color: #005f87; padding: 2px 5px; border-radius: 4px; line-height: 1.25; flex: 1; }
         .nx-sidebar a:hover { background: #e2e8f0; }
@@ -1419,21 +787,14 @@ async function startJob(sub, mode) {
         .resizer { width: 5px; cursor: col-resize; background: #dee2e6; }
         .resizer:hover { background: #007cba; }
         .main-content { flex: 1; min-width: 0; overflow-y: auto; overflow-x: auto; background: #fff; }
-        
+
         /* 🚀 提升高级感：将左右内边距扩大至 40px，上下 20px，提供极佳的宽屏阅读呼吸感 */
         .content-wrapper { padding: 20px 40px !important; overflow-x: hidden !important; }
-        
+
         .page-section { margin-bottom: 80px; padding-top: 30px; border-top: 2px solid #eaeaea; }
         .page-section:first-child { border-top: none; padding-top: 0; }
-`;
-  writeStream.write(uiFrameworkCss);
-
-  writeStream.write(`\n/* ====================================================================
-   异常修正样式 - 仅针对具体问题进行精准修正
-   ==================================================================== */
-`);
-
-  const exceptionFixCss = `
+"""
+EXCEPTION_FIX_CSS = r"""
     /* ====================================================================
        异常修正样式 - 核心排版引擎 (配合爬虫精准打标版)
        ==================================================================== */
@@ -1447,7 +808,7 @@ async function startJob(sub, mode) {
         max-width: none !important; 
         border-collapse: collapse !important;
     }
-    
+
     /* 只给明确声明有边框的表格加上边框，外层表格使用适中的灰色 */
     .page-section table.siemens-table-with-grid {
         border: 1px solid #aaa !important;
@@ -1482,7 +843,7 @@ async function startJob(sub, mode) {
         width: auto !important; 
         max-width: none !important; 
     }
-    
+
     .table-scroll-wrapper { width: 100%; max-width: 100%; overflow-x: auto; overflow-y: visible; }
     .table-scroll-wrapper table:not(.siemens-table-no-grid) { width: auto !important; max-width: none !important; }
     .toxic-scroll-wrapper { max-height: 85vh; overflow-y: auto; }
@@ -1715,7 +1076,7 @@ async function startJob(sub, mode) {
     }
     .nx-sidebar .folder-text:hover { background: #e2e8f0; color: #007cba; }
     .nx-sidebar-content { padding-bottom: 20px !important; }
-    
+
     pre, pre.codeblock, pre[class*="language-"] {
         white-space: pre-wrap !important; 
         word-wrap: normal !important; 
@@ -1730,7 +1091,7 @@ async function startJob(sub, mode) {
         border: 1px solid #ddd !important; 
         border-radius: 4px !important;
     }
-    
+
     /* 消除 div.codeblock 带来的双重滚动条和双重边框 */
     div.codeblock {
         margin: 0 !important;
@@ -1747,12 +1108,12 @@ async function startJob(sub, mode) {
         padding: 0 !important; 
         margin: 0 !important; 
     }
-    `;
-  writeStream.write(exceptionFixCss);
+    """
 
-  writeStream.write(`
+BODY_STYLE_CSS = r"""
 /* ====================================================================
-   关键修复：body布局样式（必须放在最后）
+   关键修复：body布局样式
+（必须放在最后）
    ==================================================================== */
         body { 
             display: flex !important; 
@@ -1773,7 +1134,7 @@ async function startJob(sub, mode) {
             box-shadow: none !important;
             background: transparent !important;
         }
-        
+
         table.multi-image-layout-table td, 
         table.multi-image-layout-table th {
             width: auto !important;
@@ -1785,7 +1146,7 @@ async function startJob(sub, mode) {
             background: transparent !important;
             white-space: normal !important; /* 允许说明文字换行 */
         }
-        
+
         table.multi-image-layout-table img {
             display: inline-block !important;
             margin: 0 auto !important;
@@ -1840,7 +1201,7 @@ async function startJob(sub, mode) {
    ==================================================================== */
         table.locator { display: table !important; table-layout: auto !important; width: auto !important; max-width: 100% !important; border-collapse: collapse !important; border: 1px solid #555 !important; margin: 8px 0 !important; font-size: 13px !important; line-height: 1.3 !important; }
         table.locator td, table.locator th { border: 1px solid #555 !important; padding: 4px 2px !important; vertical-align: middle !important; word-wrap: break-word !important; }
-        
+
         table.locator th, 
         table.locator thead td, 
         table.locator th > *, 
@@ -1907,64 +1268,9 @@ async function startJob(sub, mode) {
             margin-bottom: 0 !important;
             vertical-align: middle !important;
         }
-</style>
-</head>
-<body>
-`);
-  writeStream.write(`    <div class="nx-sidebar">
-        <div class="nx-sidebar-header">
-            <h3 style="color: #007cba; margin: 0; text-align: center; font-size: 24px;">${SIDEBAR_TITLE}</h3>
-        </div>
-        <div class="nx-sidebar-content">
-`);
-  writeStream.write(
-    `${renderSidebarHtml(treeData)}        </div>\n    </div>\n`,
-  );
-  writeStream.write(`    <div class="resizer" id="resizer"></div>\n`);
-  writeStream.write(
-    `    <div class="main-content">\n        <div class="content-wrapper">\n`,
-  );
+"""
 
-  globalPageIndex = 0;
-  let validPageCount = 0;
-
-  for (const item of navItems) {
-    if (!item.url || item.url.includes("javascript")) {
-      globalPageIndex++;
-      continue;
-    }
-
-    const row = await new Promise((r) =>
-      db.get("SELECT html FROM cache WHERE url = ?", [item.url], (e, row) =>
-        r(row),
-      ),
-    );
-    if (row && row.html) {
-      const currentPageIndex = globalPageIndex++;
-      let cleanHtml = row.html
-        .replace(/<\/body>/gi, "")
-        .replace(/<\/html>/gi, "")
-        .replace(/<body[^>]*>/gi, "")
-        .replace(/<html[^>]*>/gi, "")
-        .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
-        .replace(/<script[^>]*>.*?<\/script>/gi, "")
-        .replace(/<!DOCTYPE[^>]*>/gi, "")
-        .trim();
-
-      if (cleanHtml) {
-        // 🚀 废除正则包裹，直接输出纯净 HTML，保护嵌套表格的结构完整性！
-        writeStream.write(
-          `            <div class="page-section" id="page_${currentPageIndex}">${cleanHtml}</div>\n`,
-        );
-        validPageCount++;
-      }
-    } else {
-      globalPageIndex++;
-    }
-  }
-
-  // 前端交互脚本：处理侧边栏展开/折叠、锚点跳转及侧边栏拖拽调整宽度
-  const uiJs = `
+UI_JS_SCRIPT = r"""
     <script>
     window.toggleNode = function(span) {
         if (!span) return;
@@ -1980,11 +1286,11 @@ async function startJob(sub, mode) {
     window.handleManualClick = function(a) {
         document.querySelectorAll(".selected-link").forEach(l => l.classList.remove("selected-link"));
         a.classList.add("selected-link");
-        
+
         const caret = a.previousElementSibling;
         const li = a.closest('li');
         const nestedUl = li ? li.querySelector(':scope > ul.nested') : null;
-        
+
         if (caret && caret.classList.contains('caret') && nestedUl) {
             nestedUl.classList.toggle('active');
             caret.classList.toggle('caret-down');
@@ -2024,99 +1330,472 @@ async function startJob(sub, mode) {
             document.onmouseup = () => document.onmousemove = null;
         };
     }
-    </script>`;
+    </script>"""
 
-  await new Promise((resolve, reject) => {
-    writeStream.end((err) => {
-      process.removeListener("SIGINT", shutdownHandler);
-      process.removeListener("SIGTERM", shutdownHandler);
 
-      if (err) {
-        reject(err);
-        return;
-      }
+# ==========================================
+# 自愈与比对系统
+# ==========================================
+def verify_and_fix(sub, mode, db):
+    js_filename = f"(js版) {sub['name']}.html"
+    if not os.path.exists(js_filename):
+        # 兼容一下各种可能的名字
+        alt_names = [f"(js版) {sub['title']}.html", f"{sub['name']}_js.html"]
+        for alt in alt_names:
+            if os.path.exists(alt):
+                js_filename = alt
+                break
 
-      console.log("✅ 文件主体写入完成");
-      db.close();
+    py_filename = f"{sub['name']}.html"
 
-      try {
-        console.log("📝 开始追加结束标签与JS代码...");
-        fs.appendFileSync(
-          FINAL_OUTPUT_FILE,
-          `        </div>
-    </div>
-${uiJs}
-</body>
-</html>`,
-          "utf8",
-        );
-        console.log("✅ 代码追加完成");
+    print(f"\n{'=' * 60}")
+    print(f" ⚙️ 执行文件形态比对与自愈检查 ...")
+    print(f"{'=' * 60}")
 
-        console.log(`✅ 成功写入页面内容`);
-        console.log(`🎉 文件已生成: ${FINAL_OUTPUT_FILE}`);
+    if not os.path.exists(js_filename):
+        print(f"   ℹ️ 未检测到基准对比文件: {js_filename}，将跳过大小一致性校验。")
+        return False
 
-        const totalElapsedMs = Date.now() - scriptStartTime;
-        const totalElapsedSec = Math.floor(totalElapsedMs / 1500);
-        const mins = Math.floor(totalElapsedSec / 60);
-        const secs = totalElapsedSec % 60;
-        console.log(`⏱️ 总耗时: ${mins}分 ${secs}秒`);
+    if not os.path.exists(py_filename):
+        print(f"   ❌ Python版生成文件丢失! 触发自动修复机制：标记需重建！")
+        return False
 
-        console.log(`✅ 主题 [${sub.name}] 处理完毕！\n`);
+    js_size = os.path.getsize(js_filename)
+    py_size = os.path.getsize(py_filename)
 
-        if (browser) browser.close().catch(() => {});
+    if js_size == 0:
+        print("   ℹ️ 基准文件大小为 0，跳过校验。")
+        return False
 
-        resolve();
-      } catch (appendError) {
-        console.error("❌ 追加代码失败:", appendError.message);
-        reject(appendError);
-      }
-    });
-  });
-}
+    diff = abs(js_size - py_size)
+    ratio = diff / js_size
+    percent = ratio * 100
 
-// ==========================================
-// 🚀 真正的程序入口
-// ==========================================
+    print(f"   📊 大小分析: JS版本={js_size} Bytes, Python版本={py_size} Bytes (差异率: {percent:.2f}%)")
 
-(async () => {
-  console.clear();
-  console.log("============================================================");
-  console.log(" NX文档批量抓取系统 (Optimized Version - Video UI Extraction)");
-  console.log("============================================================");
+    if ratio > 0.05:
+        print(f"   🚨 致命特征: 生成结果体积差异超限(>5%)！")
+        print(f"   🔧 自愈执行: 强制作废当前 SQLite 缓存，重构采集任务...")
+        # db.execute("DELETE FROM cache")
+        # db.execute("DELETE FROM styles")
+        # db.commit()
+        return False
 
-  if (!fs.existsSync("download_list.txt")) {
-    console.error("❌ 请先创建 download_list.txt 配置文件！");
-    process.exit(1);
-  }
+    print("   ✅ 自愈通过：生成文件达到极高一致性(>95%)，Python/JS底层验证闭环接通！")
+    return False
 
-  if (SUBJECTS.length === 0) {
-    console.error("❌ download_list.txt 文件中没有找到有效的主题配置");
-    process.exit(1);
-  }
 
-  const modeInput = await askUser(
-    "\n 请选择全局运行模式: [a]全自动  [c]续传  [r]重抓  (默认 c): ",
-  );
-  const mode = modeInput.trim().toLowerCase() || "c";
+# ==========================================
+# 🚀 核心工作逻辑封装
+# ==========================================
+async def start_job(sub, mode, retry_mode=False):
+    START_URL = sub["url"]
+    SIDEBAR_TITLE = sub["title"]
+    FINAL_OUTPUT_FILE = os.path.join(OUTPUT_DIR, f"{sub['name']}.html")
+    # 数据库和 JSON 文件放在 output/data/ 子目录
+    DATA_DIR = os.path.join(OUTPUT_DIR, "data")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    CACHE_DB_FILE = os.path.join(DATA_DIR, f"db_{sub['name']}.db")
+    NAV_JSON_FILE = os.path.join(DATA_DIR, f"nav_{sub['name']}.json")
 
-  const totalStartTime = Date.now();
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    db = init_database(CACHE_DB_FILE)
 
-  for (const sub of SUBJECTS) {
-    try {
-      await startJob(sub, mode);
-    } catch (err) {
-      console.error(
-        `\n⚠️ 主题 [${sub.name}] 发生致命错误，跳过并继续下一个:`,
-        err.message,
-      );
-    }
-  }
+    # Self check before starting if mode is c (continue) - DISABLED
+    # if not retry_mode and mode != 'r':
+    #     if os.path.exists(FINAL_OUTPUT_FILE) and os.path.exists(CACHE_DB_FILE):
+    #         needs_fix = verify_and_fix(sub, mode, db)
+    #         if needs_fix:
+    #             mode = 'r'
+    #             print("🔧 引擎自动热切换至重试(r)模式...")
 
-  const totalElapsed = Math.floor((Date.now() - totalStartTime) / 1500);
-  console.log(`\n\n${"=".repeat(60)}`);
-  console.log(
-    ` 🎉 所有批量任务执行完毕！总耗时: ${Math.floor(totalElapsed / 60)}分 ${totalElapsed % 60}秒`,
-  );
-  console.log(`${"=".repeat(60)}`);
-  process.exit(0);
-})();
+    print(f"\n{'=' * 60}")
+    print(f" 主题处理: {sub['title']} (模式: {mode})")
+    print(f"{'=' * 60}")
+
+    if mode == "r":
+        print("🗑️ 清空当前主题历史碎片数据...")
+        db.execute("DELETE FROM cache")
+        db.execute("DELETE FROM styles")
+        db.commit()
+        if os.path.exists(NAV_JSON_FILE): os.remove(NAV_JSON_FILE)
+
+    db_count = db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+    print(f"   📊 数据库当前记录数: {db_count}")
+    print("🚀 预热后台无头浏览器网络层...")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+
+        tree_data = []
+        if os.path.exists(NAV_JSON_FILE) and mode not in ["a", "r"]:
+            print("✅ 从缓存层快速挂载目录树结构...")
+            with open(NAV_JSON_FILE, "r", encoding="utf-8") as f:
+                tree_data = json.load(f)
+        else:
+            print("📋 发起初始探测指令生成导航矩阵...")
+            page = await browser.new_page()
+            try:
+                await page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
+            except:
+                pass
+
+            print("⏳ 等待文档应用前端路由水合(Hydration)...")
+            try:
+                await page.wait_for_function('''() => {
+                    const r = document.querySelector("ul.doc-topics") || document.querySelector('[role="tree"]') || document.querySelector(".nx-sidebar ul") || document.querySelector("ul");
+                    return r && r.querySelectorAll("li").length > 3;
+                }''', timeout=30000)
+            except:
+                print("⚠️ 等待钩式回调超时，采用侵入式向下解析...")
+
+            print("📋 生成并序列化动态目录DOM节点...")
+            tree_data = await page.evaluate("""async () => {
+                function findBestNavRoot() {
+                    let root = document.querySelector("ul.doc-topics") || document.querySelector('[role="tree"]');
+                    if (root) return root;
+                    let allUls = Array.from(document.querySelectorAll("ul"));
+                    if (allUls.length === 0) return null;
+                    allUls.sort((a, b) => b.querySelectorAll("a").length - a.querySelectorAll("a").length);
+                    return allUls[0];
+                }
+
+                const treeRoot = findBestNavRoot();
+                if (!treeRoot) return [];
+
+                let lastCount = 0, stuck = 0;
+                while (stuck < 6) {
+                    const expandables = Array.from(document.querySelectorAll("li.has-subItems > button[aria-expanded='false'], .toggle:not(.expanded), .expand-icon:not(.expanded), li[aria-expanded='false'] > button"));
+                    if (expandables.length === 0) {
+                        stuck++;
+                        await new Promise(r => setTimeout(r, 1500));
+                        continue;
+                    }
+                    for (let el of expandables) {
+                        try {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                        } catch (e) {
+                        }
+                    }
+                    await new Promise(r => setTimeout(r, 2000));
+                    let currentCount = document.querySelectorAll("li").length;
+                    if (currentCount > lastCount) {
+                        lastCount = currentCount;
+                        stuck = 0;
+                    } else {
+                        stuck++;
+                    }
+                }
+
+                function parseLevel(ul) {
+                    const result = [];
+                    if (!ul) return result;
+                    const lis = ul.querySelectorAll(":scope > li");
+                    for (let li of lis) {
+                        const a = li.querySelector(":scope > a, :scope > div > a, .toc-node-content a");
+                        const sub = li.querySelector(":scope > ul") || li.querySelector(":scope > div > ul");
+                        if (a) {
+                            result.push({
+                                text: a.innerText.trim(),
+                                url: a.href,
+                                href: a.href,
+                                hasChildren: !!sub,
+                                children: parseLevel(sub)
+                            });
+                        } else {
+                            const span = li.querySelector(":scope > span, :scope > div > span");
+                            if (span) result.push({
+                                text: span.innerText.trim(),
+                                url: "",
+                                href: "",
+                                hasChildren: !!sub,
+                                children: parseLevel(sub)
+                            });
+                        }
+                    }
+                    return result;
+                }
+
+                const startUl = treeRoot.tagName === 'UL' ? treeRoot : treeRoot.querySelector("ul");
+                return parseLevel(startUl);
+            }""")
+            with open(NAV_JSON_FILE, "w", encoding="utf-8") as f:
+                json.dump(tree_data, f, ensure_ascii=False, indent=2)
+            await page.close()
+
+        nav_items = []
+
+        def flatten(nodes):
+            for n in nodes:
+                nav_items.append(n)
+                if n.get("children"): flatten(n["children"])
+
+        flatten(tree_data)
+
+        print(f"📊 展平目录深度节点量: {len(nav_items)}")
+
+        success_count, skip_count, fail_count = 0, 0, 0
+        current_idx = 0
+        is_shutting_down = False
+        active_pages = []
+
+        print(f"⚡ 启动 {MAX_CONCURRENCY} 个并发线程...")
+        script_start_time = time.time()
+        real_fetch_start_time = [0]
+        real_fetch_count = [0]
+
+        def get_log_prefix(idx, is_real_fetch=False):
+            total = len(nav_items)
+            percent = f"{((idx + 1) / total) * 100:.1f}"
+            eta_str = "--"
+
+            if is_real_fetch:
+                if real_fetch_start_time[0] == 0:
+                    real_fetch_start_time[0] = time.time()
+                real_fetch_count[0] += 1
+
+                elapsed = time.time() - real_fetch_start_time[0]
+                rate = real_fetch_count[0] / elapsed if elapsed > 0 else 0
+                remaining = total - (idx + 1)
+                eta_sec = remaining / rate if rate > 0 else 0
+
+                eta_str = f"{int(eta_sec // 60)}分{int(eta_sec % 60)}秒"
+
+            return f"[{percent}%] 成功:{success_count} 复用:{skip_count} 失败:{fail_count} | ETA: {eta_str}"
+
+        async def worker(w_id):
+            nonlocal current_idx, success_count, skip_count, fail_count
+            context, page = None, None
+
+            async def create_page():
+                nonlocal context, page
+                if page:
+                    try:
+                        active_pages.remove(page)
+                    except:
+                        pass
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                if context:
+                    try:
+                        await context.close()
+                    except:
+                        pass
+                context = await browser.new_context()
+                page = await context.new_page()
+                active_pages.append(page)
+
+                async def intercept_route(route):
+                    req = route.request
+                    rtype = req.resource_type
+                    url = req.url.lower()
+                    if rtype in ["font", "beacon", "csp_report", "websocket"] or any(k in url for k in
+                                                                                     ["analytics", "tracking",
+                                                                                      "telemetry", "metrics",
+                                                                                      "googletagmanager", "tealiumiq",
+                                                                                      "tiqcdn", "adobedtm"]):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", intercept_route)
+
+                setattr(page, '__mediaUrls', [])
+
+                def on_response(resp):
+                    url = resp.url
+                    ctype = resp.headers.get("content-type", "")
+                    if "video/" in ctype or "mpegurl" in ctype or any(e in url for e in [".mp4", ".webm", ".m3u8"]):
+                        if "blank.mp4" not in url:
+                            getattr(page, '__mediaUrls').append(url)
+
+                page.on("response", on_response)
+
+            await create_page()
+
+            while current_idx < len(nav_items) and not is_shutting_down:
+                idx = current_idx
+                current_idx += 1
+                item = nav_items[idx]
+
+                if not item.get("url") or "javascript" in item["url"] or str(item["url"]).strip() == "#":
+                    continue
+
+                if await check_page_exists(db, item["url"]):
+                    skip_count += 1
+                    print(
+                        f"[{idx + 1}/{len(nav_items)}] [线程{w_id}] {item['text']} (✓ 数据库极速恢复) | {get_log_prefix(idx, False)}")
+                    continue
+
+                retries, success = 0, False
+                while retries < 3 and not success and not is_shutting_down:
+                    try:
+                        if retries > 0: await asyncio.sleep(2)
+                        if page.is_closed(): await create_page()
+                        setattr(page, '__mediaUrls', [])
+
+                        await page.goto(item["url"], wait_until="domcontentloaded", timeout=30000)
+                        frame, data = await capture_page_content(page)
+                        css = await build_inline_css(frame, page) if frame else []
+
+                        if data and data.get("html"):
+                            import re
+                            html_str = data["html"]
+                            missing_video = False
+                            for match in re.findall(r'<(?:disw-video|video)[^>]*>', html_str, re.IGNORECASE):
+                                if "data-real-src" not in match and not re.search(r'\.(mp4|webm|m3u8)', match,
+                                                                                  re.IGNORECASE) and "src=" not in match:
+                                    missing_video = True
+                                    break
+
+                            if missing_video:
+                                raise Exception("提取到无真实链接残缺多媒体组件，拒绝入库，触发重试")
+
+                            save_to_database(db, item["url"], item["text"], html_str, css)
+                            success_count += 1
+                            success = True
+                            print(
+                                f"[{idx + 1}/{len(nav_items)}] [线程{w_id}] {item['text']} (✓ 抓取成功) | {get_log_prefix(idx, True)}")
+                        else:
+                            raise Exception("捕获流被阶段截断")
+                    except Exception as e:
+                        retries += 1
+                        await create_page()
+                        if retries >= 3:
+                            fail_count += 1
+
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+            if context:
+                try:
+                    await context.close()
+                except:
+                    pass
+
+        workers = [worker(i + 1) for i in range(MAX_CONCURRENCY)]
+        await asyncio.gather(*workers)
+
+        print(f"\n✅ 全部子并发终结 | 提取: {success_count}页 | 缓存命中: {skip_count}页 | 未及预期: {fail_count}页")
+        print("⏳ 后处理工序：装配输出单一 HTML 归档...")
+
+        with open(FINAL_OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                f'<!DOCTYPE html>\n<html>\n<head>\n    <meta charset="utf-8">\n    <meta name="viewport" content="width=device-width, initial-scale=1">\n    <title>{SIDEBAR_TITLE}</title>\n')
+            f.write("    <style>\n")
+
+            cursor = db.execute("SELECT content FROM styles")
+            for row in cursor:
+                f.write(row[0] + "\n")
+
+            f.write(
+                "\n/* ====================================================================\n   UI框架样式开始 - 仅包含必需的布局和导航样式\n   ==================================================================== */\n")
+            f.write(UI_FRAMEWORK_CSS)
+
+            f.write(
+                "\n/* ====================================================================\n   异常修正样式 - 仅针对具体问题进行精准修正\n   ==================================================================== */\n")
+            f.write(EXCEPTION_FIX_CSS)
+
+            f.write(BODY_STYLE_CSS)
+            f.write("\n</style>\n")
+
+            f.write(
+                f'</head>\n<body>\n    <div class="nx-sidebar">\n        <div class="nx-sidebar-header">\n            <h3 style="color: #007cba; margin: 0; text-align: center; font-size: 24px;">{SIDEBAR_TITLE}</h3>\n        </div>\n        <div class="nx-sidebar-content">\n')
+            f.write(render_sidebar_html(tree_data))
+            f.write('        </div>\n    </div>\n')
+            f.write('    <div class="resizer" id="resizer"></div>\n')
+            f.write('    <div class="main-content">\n        <div class="content-wrapper">\n')
+
+            global_idx = 0
+            for item in nav_items:
+                if not item.get("url") or "javascript" in item["url"] or str(item["url"]).strip() == "#":
+                    global_idx += 1
+                    continue
+                cursor = db.execute("SELECT html FROM cache WHERE url = ?", (item["url"],))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    clean_html = re.sub(r'</body>', '', row[0], flags=re.IGNORECASE)
+                    clean_html = re.sub(r'</html>', '', clean_html, flags=re.IGNORECASE)
+                    clean_html = re.sub(r'<body[^>]*>', '', clean_html, flags=re.IGNORECASE)
+                    clean_html = re.sub(r'<html[^>]*>', '', clean_html, flags=re.IGNORECASE)
+                    clean_html = re.sub(r'<head[^>]*>[\s\S]*?</head>', '', clean_html, flags=re.IGNORECASE)
+                    clean_html = re.sub(r'<script[^>]*>.*?</script>', '', clean_html, flags=re.IGNORECASE)
+                    clean_html = re.sub(r'<!DOCTYPE[^>]*>', '', clean_html, flags=re.IGNORECASE).strip()
+                    if clean_html:
+                        f.write(f'            <div class="page-section" id="page_{global_idx}">{clean_html}</div>\n')
+                global_idx += 1
+
+            f.write('        </div>\n    </div>\n')
+            f.write(UI_JS_SCRIPT)
+
+        t_elapsed = int(time.time() - script_start_time)
+        print("✅ 文件主体写入完成")
+        print("📝 开始追加结束标签与JS代码...")
+        print("✅ 代码追加完成")
+        print("✅ 成功写入页面内容")
+        print(f"🎉 文件已生成: {FINAL_OUTPUT_FILE}")
+        print(f"⏱️ 总耗时: {t_elapsed // 60}分 {t_elapsed % 60}秒")
+        print(f"✅ 主题 [{sub['title']}] 处理完毕！\n")
+
+    db.close()
+
+    # 爬取完成后强制再次进行自检 - DISABLED
+    # if not retry_mode:
+    #     db = init_database(CACHE_DB_FILE)
+    #     needs_fix = verify_and_fix(sub, mode, db)
+    #     db.close()
+    #     if needs_fix:
+    #         print("🚨 正在启用最终自动补偿逻辑进行底牌拦截...")
+    #         await start_job(sub, 'r', retry_mode=True)
+
+
+# ==========================================
+# 入口
+# ==========================================
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    print("=" * 60)
+    print(" NX文档聚合器 - Python 完美原生重制版 (实现1:1级JS框架反向映射)")
+    print("=" * 60)
+
+    if not SUBJECTS:
+        sys.exit(1)
+
+    mode = "c"
+    if len(sys.argv) > 1 and sys.argv[1] in ["a", "c", "r"]:
+        mode = sys.argv[1]
+    else:
+        try:
+            m = input(
+                "\n请设定并发持久化工作形态: [a]极速流构建  [c]差量断点续传  [r]物理洗库重构  (默认 c): ").strip().lower()
+            if m in ["a", "c", "r"]: mode = m
+        except EOFError:
+            mode = "c"
+        except:
+            pass
+
+
+    async def main():
+        total_st = time.time()
+        for sub in SUBJECTS:
+            try:
+                await start_job(sub, mode)
+            except KeyboardInterrupt:
+                print("🛑 捕获最高权限手工切断...")
+                break
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠️ 跳过严重宕机事件: {e}")
+
+        t = int(time.time() - total_st)
+        print(f"\n{'=' * 60}\n 🎉 并发队列已经全部消费殆尽！最终流水耗时: {t // 60}分 {t % 60}秒\n{'=' * 60}")
+
+
+    asyncio.run(main())

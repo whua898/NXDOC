@@ -19,15 +19,10 @@ yarn-error.log*
 *.swo
 *~
 
-# 抓取的 HTML 文件（不推送）
-NX*_*.html
-*.html
 
-# 输出目录（数据库和 JSON 文件）
+# 输出目录
 output/
-
-# 下载列表
-download_list.txt
+!output/README.md
 
 # 临时文件
 *.tmp
