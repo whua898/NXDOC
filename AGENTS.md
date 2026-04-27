@@ -186,23 +186,19 @@ Add-Content -Path $PROFILE -Value '[console]::OutputEncoding = [System.Text.Enco
   - **防御毒性数据撑破布局**：提取具备超长连续字符（>45）的表格赋予 `toxic-wide-table` 强行包裹断句换行机制。
   - **精确保卫嵌套结构**：由内向外扫描。含有图片的图文对比表（`multi-image-layout-table`），带代码的对照表（`code-comparison-table`）等，依据形态挂载特权级 CSS。避免粗暴全局一刀切带来的坍塌。
 - **图标与静态资源规范**：
-  - **小图标保护**：高度宽度 <=80px 的 IMG 元素强制附加 `inline-small-icon` ，防止全局控制逻辑将它们误处理成超大换行块级图片。
-  - **⚠️ 关键：图片加载等待机制**：
-    - Python 版 Playwright 存在 IPC 延迟缺陷，`frame.evaluate` 执行时图片可能未加载完成
-    - **必须在 `frame.evaluate` 内部**注入图像资源生命周期锁：
-      ```javascript
-      const imgs = Array.from(document.querySelectorAll("img"));
-      await Promise.all(imgs.map(img => {
-          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-          return new Promise(resolve => {
-              img.addEventListener('load', resolve, { once: true });
-              img.addEventListener('error', resolve, { once: true });
-              setTimeout(resolve, 1500);
-          });
-      }));
-      ```
-    - ❌ 禁止在 Python 层使用 `asyncio.sleep()` 等待图片（不够精准，全局等待浪费性能）
-    - ✅ 使用 Promise.all + load/error 事件监听（精确等待，已加载图片直接放行）
+  - **小图标保护（5层防护策略）**：
+    - **1. URL 关键字识别**：检查 src 是否包含 `icon`, `ont_`, `mfn_`, `button`, `checkbox`, `arrow`, `plus`, `minus`, `check`, `nav_`, `filter_` 等关键字
+    - **2. Class 名称特征识别**：检查 className 是否包含上述关键字（不依赖 URL）
+    - **3. 真实尺寸识别**：基于 `clientWidth/naturalWidth <= 80px`
+    - **4. 带对齐类放宽判断**：带有 `imagecenter/imageleft/imageright` 类的图标放宽到 `<= 200px`
+    - **5. img-fluid 特殊处理**：纯 `img-fluid` 类且 `<= 100px` 的也标记
+    - 所有符合条件的 IMG 元素强制附加 `inline-small-icon` ，防止全局控制逻辑将它们误处理成超大换行块级图片
+  - **双重识别机制**：
+    - **原始 DOM 初步识别**：在 `container.querySelectorAll("img")` 上执行首次识别
+    - **Clone 后二次识别**：在图片 URL 绝对化/Base64 转换后再次识别（跳过已有 `inline-small-icon` 类的图片）
+  - **Node.js vs Python 架构差异**：
+    - **Node.js 版**：原生同步调用，无 IPC 延迟，`frame.evaluate` 执行时图片通常已加载完成，可直接读取尺寸
+    - **Python 版**：跨语言 JSON-RPC 异步通信，存在数十到上百毫秒 IPC 延迟，必须在 `frame.evaluate` 内部注入"图像资源生命周期锁"等待图片加载
   - **图片绝对化与内联化**：为了最终单文件分放，首选抓取 Buffer 提取 Base64 塞入 src；无法下载或无需下载的大型媒体保留包含基站地址完整的绝对 URL (`absoluteUrl`)。
 
 ### 5. 爬虫性能底座与长期稳定运行机制 (Performance & Memory Mgt)
