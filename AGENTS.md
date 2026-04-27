@@ -38,12 +38,45 @@
 - **禁止使用 Unix 风格命令**：不使用 `cp`, `rm`, `ls`, `cat` 等 Linux/Mac 命令
 - **路径分隔符**：Windows 使用反斜杠 `\`，但在 PowerShell 字符串中正斜杠 `/` 也可用
 
-### UTF-8 BOM 编码强制要求
-- **所有 .ps1 脚本文件必须使用 UTF-8 with BOM 编码**：
-  - PyCharm 设置：File → Settings → Editor → File Encodings → 勾选 "UTF-8 with BOM"
-  - 或使用 PowerShell 转换：`[System.IO.File]::WriteAllText("script.ps1", $content, [System.Text.UTF8Encoding]::new($true))`
-- **Python 文件使用标准 UTF-8（无 BOM）**：PyCharm 默认即可
-- **HTML/JSON 配置文件使用 UTF-8 with BOM**：确保中文字符正确显示
+### UTF-8 编码终极解决方案（系统级配置）
+
+**🎯 核心原则：一劳永逸，系统级解决 PowerShell 中文乱码问题**
+
+**✅ 终极方案：修改 PowerShell 系统级启动配置文件**
+
+在任意可以正常敲字的 PowerShell 终端中执行以下两行命令：
+
+```powershell
+# 1. 确保你有 PowerShell 配置文件（如果没有会自动创建）
+if (!(Test-Path -Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force }
+
+# 2. 把 UTF-8 设置永久写进系统的启动文件里
+Add-Content -Path $PROFILE -Value '[console]::OutputEncoding = [System.Text.Encoding]::UTF8'
+```
+
+**执行后的操作**：
+1. PyCharm 的 Shell path 保持默认 `powershell.exe`（无需任何修改）
+2. 关闭当前所有终端窗口
+3. 重新打开终端，PowerShell 会自动将编码切换为 UTF-8
+4. 以后每次打开终端，自动生效，永不失效
+
+**优势**：
+- ✅ **系统级生效**：所有 PowerShell 会话（包括 PyCharm、VSCode、Windows Terminal）都受益
+- ✅ **零配置**：IDE 无需任何特殊设置，保持默认即可
+- ✅ **永久有效**：写入 `$PROFILE` 文件，重启后依然生效
+- ✅ **无副作用**：不影响其他程序，只改变 PowerShell 的输出编码
+
+**⚠️ 注意事项**：
+- ❌ 不要在每个项目中单独处理编码问题
+- ❌ 不要使用 `chcp 65001` 等临时方案
+- ❌ 不要在 Python 代码中使用 `io.TextIOWrapper` 强制指定编码（除非必要）
+- ✅ 优先使用系统级配置，从根本上解决问题
+
+**验证方法**：
+```powershell
+# 在新打开的终端中执行，应该输出 "utf-8"
+[Console]::OutputEncoding.WebName
+```
 
 ### PyCharm 终端配置
 - **默认 Shell**：PowerShell（不是 CMD 或 WSL）
