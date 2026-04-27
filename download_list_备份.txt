@@ -1,0 +1,26 @@
+NX2512 基于特征加工
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20250429951538534.mfgholemaking/xid1754410
+
+NX2512 后处理构造器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20250429951538534.postbuilder/xid1850431
+
+NX2512 后处理配置器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20250429951538534.mfgpostconfig/xid1850553
+
+NX12 基于特征加工
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgholemaking/feat_based_mach_fbm_overview
+
+NX12 后处理配置器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.mfgpostconfig/xid998591
+
+NX12 后处理构造器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20190529153536917.postbuilder/mainmenu_post_postproc_v1
+
+NX2506 基于特征加工
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgholemaking/xid1754410
+
+NX2506 后处理配置器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.mfgpostconfig/xid1850553
+
+NX2506 后处理构造器
+https://docs.sw.siemens.com/zh-CN/doc/209349590/PL20241101461013487.postbuilder/xid1850431

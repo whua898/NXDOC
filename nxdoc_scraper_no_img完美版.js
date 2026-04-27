@@ -566,12 +566,46 @@ async function capturePageContent(page) {
       const container =
         document.querySelector("div.doc-content") || document.body;
 
-      // 🌟 识别小图标，防止被误判为大图居中
+      // 🌟 在原始 DOM 上初步识别小图标（多维度识别策略）
       container.querySelectorAll("img").forEach((img) => {
-        if (
-          (img.clientWidth > 0 && img.clientWidth <= 80) ||
-          (img.naturalWidth > 0 && img.naturalWidth <= 80)
-        ) {
+        const src = (img.getAttribute("src") || img.src || "").toLowerCase();
+        const classStr = img.className.toLowerCase();
+        
+        // 检查是否带有对齐类但实际尺寸很小
+        const hasAlignClass = img.classList.contains("imagecenter") || 
+                              img.classList.contains("imageleft") ||
+                              img.classList.contains("imageright");
+        
+        // 🌟 增强识别策略：
+        // 1. 基于原始 URL 特征
+        const hasUrlKeywords = src.includes("icon") || src.includes("ont_") || 
+                               src.includes("mfn_") || src.includes("button") ||
+                               src.includes("checkbox") || src.includes("arrow") ||
+                               src.includes("plus") || src.includes("minus") ||
+                               src.includes("check") || src.includes("nav_") ||
+                               src.includes("filter_");
+        
+        // 2. 基于 class 名称特征（不依赖 URL）
+        const hasIconKeywords = classStr.includes("icon") || classStr.includes("ont_") || 
+                                classStr.includes("mfn_") || classStr.includes("button") ||
+                                classStr.includes("checkbox") || classStr.includes("arrow") ||
+                                classStr.includes("plus") || classStr.includes("minus") ||
+                                classStr.includes("check") || classStr.includes("nav_") ||
+                                classStr.includes("filter_");
+        
+        // 3. 基于真实尺寸识别
+        const isSmallBySize = (img.clientWidth > 0 && img.clientWidth <= 80) || 
+                              (img.naturalWidth > 0 && img.naturalWidth <= 80);
+        
+        // 4. 带对齐类的小图标放宽到 200px
+        const isSmallWithAlign = hasAlignClass && img.naturalWidth > 0 && img.naturalWidth <= 200;
+        
+        // 5. 只有 img-fluid 类且尺寸很小的也标记
+        const isFluidOnly = img.classList.contains("img-fluid") && 
+                           !img.classList.contains("image") &&
+                           img.naturalWidth > 0 && img.naturalWidth <= 100;
+        
+        if (hasUrlKeywords || hasIconKeywords || isSmallBySize || isSmallWithAlign || isFluidOnly) {
           img.classList.add("inline-small-icon");
         }
       });
@@ -596,6 +630,53 @@ async function capturePageContent(page) {
           // 移除懒加载，强制浏览器在初始加载时获取图片，避免滚动时实时请求导致卡顿
           img.removeAttribute("loading");
           img.setAttribute("decoding", "async");
+        }
+      });
+
+      // 🌟 再次在 clone 上识别小图标（多维度识别策略）
+      clone.querySelectorAll("img").forEach((img) => {
+        // 如果已经有 inline-small-icon 类，跳过
+        if (img.classList.contains("inline-small-icon")) return;
+        
+        const src = (img.getAttribute("src") || img.src || "").toLowerCase();
+        const classStr = img.className.toLowerCase();
+        
+        // 检查是否带有对齐类但实际尺寸很小
+        const hasAlignClass = img.classList.contains("imagecenter") || 
+                              img.classList.contains("imageleft") ||
+                              img.classList.contains("imageright");
+        
+        // 🌟 增强识别策略：
+        // 1. 基于原始 URL 特征（即使相对路径转绝对路径后也能匹配）
+        const hasUrlKeywords = src.includes("icon") || src.includes("ont_") || 
+                               src.includes("mfn_") || src.includes("button") ||
+                               src.includes("checkbox") || src.includes("arrow") ||
+                               src.includes("plus") || src.includes("minus") ||
+                               src.includes("check") || src.includes("nav_") ||
+                               src.includes("filter_");
+        
+        // 2. 基于 class 名称特征（不依赖 URL）
+        const hasIconKeywords = classStr.includes("icon") || classStr.includes("ont_") || 
+                                classStr.includes("mfn_") || classStr.includes("button") ||
+                                classStr.includes("checkbox") || classStr.includes("arrow") ||
+                                classStr.includes("plus") || classStr.includes("minus") ||
+                                classStr.includes("check") || classStr.includes("nav_") ||
+                                classStr.includes("filter_");
+        
+        // 3. 基于真实尺寸识别
+        const isSmallBySize = (img.clientWidth > 0 && img.clientWidth <= 80) || 
+                              (img.naturalWidth > 0 && img.naturalWidth <= 80);
+        
+        // 4. 带对齐类的小图标放宽到 200px
+        const isSmallWithAlign = hasAlignClass && img.naturalWidth > 0 && img.naturalWidth <= 200;
+        
+        // 5. 只有 img-fluid 类且尺寸很小的也标记
+        const isFluidOnly = img.classList.contains("img-fluid") && 
+                           !img.classList.contains("image") &&
+                           img.naturalWidth > 0 && img.naturalWidth <= 100;
+        
+        if (hasUrlKeywords || hasIconKeywords || isSmallBySize || isSmallWithAlign || isFluidOnly) {
+          img.classList.add("inline-small-icon");
         }
       });
 

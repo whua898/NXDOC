@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NX文档聚合器 - Python 完美移植版 (v11.28)
-完全复刻 nxdoc_scraper_no_img完美版.js 核心逻辑
+NX文档聚合器 - Python 完美原生重制版 (with_img) (v11.28)
+完全复刻 nxdoc_scraper_with_img完美版.js 核心逻辑
 自动与 JS 版的大小比对并自愈
 """
 
@@ -252,88 +252,43 @@ async () => {
       // 🌟 识别小图标，防止被误判为大图居中（现在图片已完全加载）
       container.querySelectorAll("img").forEach((img) => {
         const src = (img.getAttribute("src") || img.src || "").toLowerCase();
-        
-        // 🌟 增强识别策略：
-        // 1. 基于 URL 特征
-        const hasUrlKeywords = src.includes("icon") || src.includes("ont_") || 
-                               src.includes("mfn_") || src.includes("button") ||
-                               src.includes("checkbox") || src.includes("arrow") ||
-                               src.includes("plus") || src.includes("minus") ||
-                               src.includes("check") || src.includes("nav_");
-        
-        // 2. 基于真实尺寸识别（图片已完全加载，尺寸准确）
-        const isSmallBySize = (img.clientWidth > 0 && img.clientWidth <= 80) || 
-                              (img.naturalWidth > 0 && img.naturalWidth <= 80);
-        
-        if (hasUrlKeywords || isSmallBySize) {
+        if (
+          src.includes("icon") ||
+          src.includes("ont_") ||
+          src.includes("mfn_") ||
+          src.includes("button") ||
+          src.includes("checkbox") ||
+          src.includes("arrow") ||
+          src.includes("plus") ||
+          src.includes("minus") ||
+          src.includes("check") ||
+          src.includes("nav_") ||
+          (img.clientWidth > 0 && img.clientWidth <= 80) ||
+          (img.naturalWidth > 0 && img.naturalWidth <= 80)
+        ) {
           img.classList.add("inline-small-icon");
         }
       });
 
       const clone = container.cloneNode(true);
 
-      // 🚀 关键修复：在 clone 上再次等待所有图片加载完成
-      // 原因：clone 是深拷贝，图片需要重新渲染，naturalWidth 可能暂时返回 0
-      const clonedImages = Array.from(clone.querySelectorAll("img"));
-      if (clonedImages.length > 0) {
-        await Promise.all(
-          clonedImages.map((img) => {
-            // 如果已经加载完成且尺寸有效，直接放行
-            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-            
-            // 否则等待加载
-            return new Promise((resolve) => {
-              img.addEventListener("load", resolve, { once: true });
-              img.addEventListener("error", resolve, { once: true });
-              setTimeout(resolve, 1000); // 容错：每个图片最多硬等 1 秒
-            });
-          })
-        );
-      }
-
-      // 🌟 再次在 clone 上识别小图标（多维度识别策略）
+      // 🌟 再次在 clone 上识别小图标（基于 URL 特征，不依赖尺寸）
+      // 注意：clone 是从已加载完成的 container 克隆的，所以尺寸已经准确
       clone.querySelectorAll("img").forEach((img) => {
-        // 如果已经有 inline-small-icon 类，跳过
-        if (img.classList.contains("inline-small-icon")) return;
-        
         const src = (img.getAttribute("src") || img.src || "").toLowerCase();
-        const classStr = img.className.toLowerCase();
-        
-        // 检查是否带有对齐类但实际尺寸很小
-        const hasAlignClass = img.classList.contains("imagecenter") || 
-                              img.classList.contains("imageleft") ||
-                              img.classList.contains("imageright");
-        
-        // 🌟 增强识别策略：
-        // 1. 基于原始 URL 特征（即使相对路径转绝对路径后也能匹配）
-        const hasUrlKeywords = src.includes("icon") || src.includes("ont_") || 
-                               src.includes("mfn_") || src.includes("button") ||
-                               src.includes("checkbox") || src.includes("arrow") ||
-                               src.includes("plus") || src.includes("minus") ||
-                               src.includes("check") || src.includes("nav_") ||
-                               src.includes("filter_");
-        
-        // 2. 基于 class 名称特征（不依赖 URL）
-        const hasIconKeywords = classStr.includes("icon") || classStr.includes("ont_") || 
-                                classStr.includes("mfn_") || classStr.includes("button") ||
-                                classStr.includes("checkbox") || classStr.includes("arrow") ||
-                                classStr.includes("plus") || classStr.includes("minus") ||
-                                classStr.includes("check") || classStr.includes("nav_") ||
-                                classStr.includes("filter_");
-        
-        // 3. 基于真实尺寸识别（Base64 已加载完成，尺寸准确）
-        const isSmallBySize = (img.clientWidth > 0 && img.clientWidth <= 80) || 
-                              (img.naturalWidth > 0 && img.naturalWidth <= 80);
-        
-        // 4. 带对齐类的小图标放宽到 200px
-        const isSmallWithAlign = hasAlignClass && img.naturalWidth > 0 && img.naturalWidth <= 200;
-        
-        // 5. 只有 img-fluid 类且尺寸很小的也标记
-        const isFluidOnly = img.classList.contains("img-fluid") && 
-                           !img.classList.contains("image") &&
-                           img.naturalWidth > 0 && img.naturalWidth <= 100;
-        
-        if (hasUrlKeywords || hasIconKeywords || isSmallBySize || isSmallWithAlign || isFluidOnly) {
+        if (
+          src.includes("icon") ||
+          src.includes("ont_") ||
+          src.includes("mfn_") ||
+          src.includes("button") ||
+          src.includes("checkbox") ||
+          src.includes("arrow") ||
+          src.includes("plus") ||
+          src.includes("minus") ||
+          src.includes("check") ||
+          src.includes("nav_") ||
+          src.includes("filter_")
+        ) {
           img.classList.add("inline-small-icon");
         }
       });
@@ -348,14 +303,94 @@ async () => {
 
       const baseUrl = document.baseURI;
 
-      // 前置处理：将所有图片的相对链接转换为绝对链接，并移除懒加载以保证滚动流畅
+            // 前置处理：将所有图片的相对链接转换为绝对链接，并移除懒加载以保证滚动流畅
+      // 将图片转换为 Base64 内联到 HTML 中（并行加速）
+      const images = Array.from(clone.querySelectorAll("img"));
+      await Promise.all(
+        images.map(async (img) => {
+          if (img.hasAttribute("src")) {
+            const originalSrc = img.getAttribute("src");
+            if (originalSrc.startsWith("data:")) return; // 已经是 base64
+
+            const absoluteUrl = new URL(originalSrc, baseUrl).href;
+            try {
+              const response = await fetch(absoluteUrl);
+              if (response.ok) {
+                const blob = await response.blob();
+                const base64data = await new Promise((resolve) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => resolve(reader.result);
+                  reader.readAsDataURL(blob);
+                });
+                img.src = base64data;
+              } else {
+                img.src = absoluteUrl;
+              }
+            } catch (e) {
+              img.src = absoluteUrl;
+            }
+            // 移除懒加载，强制浏览器在初始加载时获取图片，避免滚动时实时请求导致卡顿
+            img.removeAttribute("loading");
+            img.setAttribute("decoding", "async");
+          }
+        })
+      );
+
+      // 🌟 Base64 转换后，再次识别小图标（基于渲染后的真实尺寸）
+      // 原因：部分图标在转换前尺寸未确定，或 URL 不包含关键字
+      
+      // 🚀 关键修复：Base64 转换后，图片需要重新渲染，必须再次等待加载完成
+      const convertedImages = Array.from(clone.querySelectorAll("img"));
+      if (convertedImages.length > 0) {
+        await Promise.all(
+          convertedImages.map((img) => {
+            // 如果已经加载完成且尺寸有效，直接放行
+            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+            
+            // 否则等待加载
+            return new Promise((resolve) => {
+              img.addEventListener("load", resolve, { once: true });
+              img.addEventListener("error", resolve, { once: true });
+              setTimeout(resolve, 1000); // 容错：每个图片最多硬等 1 秒
+            });
+          })
+        );
+      }
+      
       clone.querySelectorAll("img").forEach((img) => {
-        if (img.hasAttribute("src")) {
-          const absoluteUrl = new URL(img.getAttribute("src"), baseUrl).href;
-          img.src = absoluteUrl;
-          // 移除懒加载，强制浏览器在初始加载时获取图片，避免滚动时实时请求导致卡顿
-          img.removeAttribute("loading");
-          img.setAttribute("decoding", "async");
+        // 如果已经有 inline-small-icon 类，跳过
+        if (img.classList.contains("inline-small-icon")) return;
+        
+        const classStr = img.className.toLowerCase();
+        
+        // 检查是否带有对齐类但实际尺寸很小
+        const hasAlignClass = img.classList.contains("imagecenter") || 
+                              img.classList.contains("imageleft") ||
+                              img.classList.contains("imageright");
+        
+        // 🌟 增强识别策略：
+        // 1. 基于原始 class 特征（即使 Base64 后也能从 class 判断）
+        const hasIconKeywords = classStr.includes("icon") || classStr.includes("ont_") || 
+                                classStr.includes("mfn_") || classStr.includes("button") ||
+                                classStr.includes("checkbox") || classStr.includes("arrow") ||
+                                classStr.includes("plus") || classStr.includes("minus") ||
+                                classStr.includes("check") || classStr.includes("nav_") ||
+                                classStr.includes("filter_");
+        
+        // 2. 基于真实尺寸识别（Base64 已加载完成，尺寸准确）
+        const isSmallBySize = (img.clientWidth > 0 && img.clientWidth <= 80) || 
+                              (img.naturalWidth > 0 && img.naturalWidth <= 80);
+        
+        // 3. 带对齐类的小图标放宽到 200px
+        const isSmallWithAlign = hasAlignClass && img.naturalWidth > 0 && img.naturalWidth <= 200;
+        
+        // 4. 只有 img-fluid 类且尺寸很小的也标记
+        const isFluidOnly = img.classList.contains("img-fluid") && 
+                           !img.classList.contains("image") &&
+                           img.naturalWidth > 0 && img.naturalWidth <= 100;
+        
+        if (hasIconKeywords || isSmallBySize || isSmallWithAlign || isFluidOnly) {
+          img.classList.add("inline-small-icon");
         }
       });
 
@@ -1192,7 +1227,7 @@ BODY_STYLE_CSS = r"""
             white-space: normal !important; /* 允许说明文字换行 */
         }
 
-        table.multi-image-layout-table img {
+        table.multi-image-layout-table img:not(.inline-small-icon) {
             display: inline-block !important;
             margin: 0 auto !important;
             max-width: 100% !important;
@@ -1295,7 +1330,7 @@ BODY_STYLE_CSS = r"""
 /* ====================================================================
    图片默认居中修复 (增强版：精准排除树状图组件与各种行内小图标)
    ==================================================================== */
-        .page-section img:not([src*="icon" i]):not([src*="ont_" i]):not([src*="mfn_" i]):not([src*="button" i]):not([src*="checkbox" i]):not(.inline-small-icon) {
+        .page-section img:not([src*="icon" i]):not([src*="ont_" i]):not([src*="mfn_" i]):not([src*="button" i]):not([src*="checkbox" i]):not([src*="arrow" i]):not([src*="plus" i]):not([src*="minus" i]):not([src*="check" i]):not([src*="nav_" i]):not([src*="filter_" i]):not(.inline-small-icon) {
             display: block;
             margin-left: auto !important;
             margin-right: auto !important;
@@ -1306,6 +1341,12 @@ BODY_STYLE_CSS = r"""
         .page-section img[src*="mfn_" i],
         .page-section img[src*="button" i],
         .page-section img[src*="checkbox" i],
+        .page-section img[src*="arrow" i],
+        .page-section img[src*="plus" i],
+        .page-section img[src*="minus" i],
+        .page-section img[src*="check" i],
+        .page-section img[src*="nav_" i],
+        .page-section img[src*="filter_" i],
         .page-section img.inline-small-icon {
             display: inline-block !important;
             margin-left: 0 !important;
