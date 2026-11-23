@@ -1,4 +1,5 @@
 # Python
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -27,3 +28,6 @@ output/
 # 临时文件
 *.tmp
 *.log
+
+# uv 工作流：依赖事实源 = pyproject.toml + uv.lock（两者均入库，勿忽略）
+# 新增/变更依赖请用 uv add，不要手改 pyproject.toml
